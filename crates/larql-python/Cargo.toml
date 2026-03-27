@@ -1,0 +1,16 @@
+[package]
+name = "larql-python"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Python bindings for LARQL knowledge graph engine"
+
+[lib]
+name = "_larql_core"
+crate-type = ["cdylib"]
+
+[dependencies]
+larql-core = { path = "../larql-core" }
+pyo3 = { version = "0.23", features = ["extension-module"] }
+serde_json = { workspace = true }
