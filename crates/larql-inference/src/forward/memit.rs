@@ -21,9 +21,9 @@
 //! distribution across L8-L12 on v11 TinyStories 115M. See
 //! `experiments/15_v11_model/RESULTS.md §20`.
 
-use ndarray::{Array1, Array2};
-use crate::model::ModelWeights;
 use super::trace::{capture_ffn_activation_matrix, estimate_ffn_covariance};
+use crate::model::ModelWeights;
+use ndarray::{Array1, Array2};
 
 /// A single fact to be compiled via MEMIT.
 #[derive(Debug, Clone)]
@@ -94,6 +94,108 @@ const COVARIANCE_PROMPTS: &[&str] = &[
     "The painting was created during the",
 ];
 
+/// Run MEMIT with PRE-OPTIMISED target deltas.
+///
+/// For each fact, runs `optimise_target_delta` (at the last layer, by
+/// the constraints of the current backward-pass port — see
+/// `target_delta.rs`) to find the residual perturbation that produces
+/// the target. That delta replaces the `target_alpha × unit(embed)`
+/// shortcut as R (the "what the edit should produce beyond the
+/// current output") in the MEMIT closed-form solve.
+///
+/// This matches the Python reference's two-phase pipeline: Phase 3
+/// gradient-optimise per-fact delta, Phase 4 closed-form W_down edit
+/// using that delta as V*.
+///
+/// Note: optimisation is done at `n_layers-1` (currently only
+/// supported install layer); the resulting delta is used as R for
+/// whatever layer each fact was registered at. When those layers
+/// differ, the "optimise at output, edit upstream" heuristic applies
+/// — residual connections propagate the signal approximately intact,
+/// though not identically.
+pub fn run_memit_with_target_opt(
+    weights: &ModelWeights,
+    facts: &[MemitFact],
+    ridge: f64,
+    td_opts: crate::forward::target_delta::TargetDeltaOpts,
+    tokenizer: &tokenizers::Tokenizer,
+) -> Result<Vec<MemitResult>, String> {
+    run_memit_with_target_opt_multi(weights, facts, ridge, td_opts, tokenizer, 1)
+}
+
+/// Multi-layer target-delta MEMIT (Python reference Phase 4).
+///
+/// For each fact:
+///   1. optimise delta at `n_layers - 1` (the only layer the current
+///      backward port supports end-to-end).
+///   2. split delta across `spread` consecutive layers centred on
+///      `fact.layer` — each layer gets `delta / spread`.
+///   3. run MEMIT closed-form solve per layer with the layer's share
+///      as R. Smaller per-layer deltas → smaller ΔW per layer → less
+///      template-shared bleed at scale.
+///
+/// `spread = 1` is identical to single-layer MEMIT with target-delta.
+/// Python reference used `spread = 5` for 200/200 on v11 (L8-L12).
+pub fn run_memit_with_target_opt_multi(
+    weights: &ModelWeights,
+    facts: &[MemitFact],
+    ridge: f64,
+    td_opts: crate::forward::target_delta::TargetDeltaOpts,
+    tokenizer: &tokenizers::Tokenizer,
+    spread: usize,
+) -> Result<Vec<MemitResult>, String> {
+    if facts.is_empty() {
+        return Ok(Vec::new());
+    }
+    let spread = spread.max(1);
+    let n_layers = weights.arch.config().num_layers;
+    let last_layer = n_layers - 1;
+
+    // Phase 3: optimise target delta per fact at last layer.
+    let mut optimised_deltas: Vec<Array1<f32>> = Vec::with_capacity(facts.len());
+    for fact in facts {
+        let td = crate::forward::target_delta::optimise_target_delta(
+            weights,
+            &fact.prompt_tokens,
+            fact.target_token_id,
+            last_layer,
+            td_opts,
+        )?;
+        optimised_deltas.push(td.delta);
+    }
+
+    // Phase 4: duplicate each fact across `spread` layers centred on
+    // fact.layer, each with delta/spread as its share.
+    let mut expanded_facts: Vec<MemitFact> = Vec::with_capacity(facts.len() * spread);
+    let mut expanded_deltas: Vec<Array1<f32>> = Vec::with_capacity(facts.len() * spread);
+    let half = (spread as isize) / 2;
+    let inv_spread = 1.0_f32 / spread as f32;
+    for (i, fact) in facts.iter().enumerate() {
+        for s in 0..spread as isize {
+            let offset = s - half;
+            let new_layer = (fact.layer as isize + offset)
+                .max(0)
+                .min(n_layers as isize - 1) as usize;
+            expanded_facts.push(MemitFact {
+                prompt_tokens: fact.prompt_tokens.clone(),
+                target_token_id: fact.target_token_id,
+                layer: new_layer,
+                label: format!("{} [{}/{}]", fact.label, s + 1, spread),
+            });
+            let scaled: Array1<f32> = optimised_deltas[i].map(|v| v * inv_spread);
+            expanded_deltas.push(scaled);
+        }
+    }
+
+    run_memit_inner(
+        weights,
+        &expanded_facts,
+        ridge,
+        RSource::OptimisedDeltas(&expanded_deltas),
+        tokenizer,
+    )
+}
+
 /// Run the full MEMIT pipeline: estimate covariance, compute per-fact
 /// activations and targets, solve the closed-form weight edit.
 ///
@@ -107,6 +209,30 @@ pub fn run_memit(
     target_alpha: f32,
     tokenizer: &tokenizers::Tokenizer,
 ) -> Result<Vec<MemitResult>, String> {
+    run_memit_inner(
+        weights,
+        facts,
+        ridge,
+        RSource::EmbedShortcut(target_alpha),
+        tokenizer,
+    )
+}
+
+/// Source for the R matrix rows — either per-fact optimised residual
+/// deltas (from `optimise_target_delta`) or the embed-shortcut
+/// `target_alpha × unit(embed[target])`.
+enum RSource<'a> {
+    EmbedShortcut(f32),
+    OptimisedDeltas(&'a [Array1<f32>]),
+}
+
+fn run_memit_inner(
+    weights: &ModelWeights,
+    facts: &[MemitFact],
+    ridge: f64,
+    r_source: RSource<'_>,
+    tokenizer: &tokenizers::Tokenizer,
+) -> Result<Vec<MemitResult>, String> {
     if facts.is_empty() {
         return Ok(Vec::new());
     }
@@ -118,7 +244,6 @@ pub fn run_memit(
         by_layer.entry(fact.layer).or_default().push(fact);
     }
 
-    // Tokenise covariance prompts once.
     let cov_tokens: Vec<Vec<u32>> = COVARIANCE_PROMPTS
         .iter()
         .filter_map(|p| {
@@ -131,19 +256,46 @@ pub fn run_memit(
 
     let mut results = Vec::new();
 
+    // Build a fact-index map so RSource::OptimisedDeltas can look up
+    // the delta corresponding to each fact passed into the per-layer
+    // solver.
+    let fact_index_map: std::collections::HashMap<(usize, u32, Vec<u32>), usize> = facts
+        .iter()
+        .enumerate()
+        .map(|(i, f)| ((f.layer, f.target_token_id, f.prompt_tokens.clone()), i))
+        .collect();
+
     for (layer, layer_facts) in &by_layer {
-        let result = memit_solve_layer(
-            weights,
-            layer_facts,
-            *layer,
-            &cov_tokens,
-            ridge,
-            target_alpha,
-        )?;
+        let layer_r = match r_source {
+            RSource::EmbedShortcut(alpha) => RPerLayer::EmbedShortcut(alpha),
+            RSource::OptimisedDeltas(all_deltas) => {
+                let mut slice = Vec::with_capacity(layer_facts.len());
+                for f in layer_facts {
+                    let key = (f.layer, f.target_token_id, f.prompt_tokens.clone());
+                    let idx = fact_index_map.get(&key).copied().ok_or_else(|| {
+                        format!(
+                            "MEMIT: cannot locate optimised delta for fact '{}'",
+                            f.label
+                        )
+                    })?;
+                    slice.push(all_deltas[idx].clone());
+                }
+                RPerLayer::OptimisedDeltas(slice)
+            }
+        };
+
+        let result = memit_solve_layer(weights, layer_facts, *layer, &cov_tokens, ridge, layer_r)?;
         results.push(result);
     }
 
     Ok(results)
+}
+
+/// Per-layer view of the R source — the shortcut scalar or the
+/// subset of optimised deltas for this layer's facts.
+enum RPerLayer {
+    EmbedShortcut(f32),
+    OptimisedDeltas(Vec<Array1<f32>>),
 }
 
 /// MEMIT solve for a single layer — the core algorithm.
@@ -153,14 +305,17 @@ fn memit_solve_layer(
     layer: usize,
     cov_tokens: &[Vec<u32>],
     ridge: f64,
-    target_alpha: f32,
+    r_source: RPerLayer,
 ) -> Result<MemitResult, String> {
     let n = facts.len();
     let hidden = weights.hidden_size;
     let ffn_dim = weights.intermediate_size;
 
     // ── Step 1: Estimate covariance C at this layer ──
-    let (cov_f32, sample_count) = estimate_ffn_covariance(weights, cov_tokens, layer)
+    let mut cov_tokens_full: Vec<Vec<u32>> = cov_tokens.to_vec();
+    cov_tokens_full.extend(facts.iter().map(|f| f.prompt_tokens.clone()));
+
+    let (cov_f32, sample_count) = estimate_ffn_covariance(weights, &cov_tokens_full, layer)
         .ok_or_else(|| format!("MEMIT: failed to estimate covariance at layer {layer}"))?;
 
     if sample_count < 100 {
@@ -203,7 +358,9 @@ fn memit_solve_layer(
     // Verify W_down exists at this layer (the delta will be added to it).
     let w_down_key = weights.arch.ffn_down_key(layer);
     if !weights.tensors.contains_key(&w_down_key) {
-        return Err(format!("MEMIT: W_down not found at layer {layer} (key: {w_down_key})"));
+        return Err(format!(
+            "MEMIT: W_down not found at layer {layer} (key: {w_down_key})"
+        ));
     }
 
     // ── Step 3+4: Compute R (deltas) and K matrices ──
@@ -220,16 +377,46 @@ fn memit_solve_layer(
         k_mat.row_mut(i).assign(k);
     }
 
-    // Build R matrix [N × hidden] — the target embedding deltas.
+    // Build R matrix [N × hidden] — either per-fact embed shortcut
+    // or optimised target deltas.
     let mut r_mat = Array2::<f64>::zeros((n, hidden));
-    for (i, fact) in facts.iter().enumerate() {
-        let embed_row = weights.embed.row(fact.target_token_id as usize);
-        let embed_norm: f32 = embed_row.iter().map(|v| v * v).sum::<f32>().sqrt();
-        let scale = if embed_norm > 1e-8 { target_alpha / embed_norm } else { 0.0 };
-        for j in 0..hidden {
-            r_mat[[i, j]] = (embed_row[j] * scale) as f64;
+    match &r_source {
+        RPerLayer::EmbedShortcut(target_alpha) => {
+            for (i, fact) in facts.iter().enumerate() {
+                let embed_row = weights.embed.row(fact.target_token_id as usize);
+                let embed_norm: f32 = embed_row.iter().map(|v| v * v).sum::<f32>().sqrt();
+                let scale = if embed_norm > 1e-8 {
+                    target_alpha / embed_norm
+                } else {
+                    0.0
+                };
+                for j in 0..hidden {
+                    r_mat[[i, j]] = (embed_row[j] * scale) as f64;
+                }
+                fact_results[i].target_norm = embed_norm;
+            }
         }
-        fact_results[i].target_norm = embed_norm;
+        RPerLayer::OptimisedDeltas(deltas) => {
+            if deltas.len() != n {
+                return Err(format!(
+                    "MEMIT: optimised delta count {} != fact count {n}",
+                    deltas.len()
+                ));
+            }
+            for (i, delta) in deltas.iter().enumerate() {
+                if delta.len() != hidden {
+                    return Err(format!(
+                        "MEMIT: optimised delta[{i}] has len {} ≠ hidden {hidden}",
+                        delta.len()
+                    ));
+                }
+                for j in 0..hidden {
+                    r_mat[[i, j]] = delta[j] as f64;
+                }
+                let d_norm: f32 = delta.iter().map(|v| v * v).sum::<f32>().sqrt();
+                fact_results[i].target_norm = d_norm;
+            }
+        }
     }
 
     // C⁻¹ via Cholesky [ffn_dim × ffn_dim]
@@ -281,6 +468,7 @@ fn memit_solve_layer(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engines::test_utils::make_test_weights;
 
     #[test]
     fn test_memit_fact_creation() {
@@ -292,5 +480,74 @@ mod tests {
         };
         assert_eq!(fact.layer, 10);
         assert_eq!(fact.target_token_id, 42);
+    }
+
+    // ── Empty-facts fast path (no tokenizer needed) ────────────────────────────
+
+    #[test]
+    fn run_memit_empty_facts_returns_empty() {
+        use crate::engines::test_utils::make_test_tokenizer;
+        let weights = make_test_weights();
+        // by_layer is empty → run_memit_inner returns before touching the tokenizer.
+        // Pass a real tokenizer so the test doesn't rely on pointer provenance.
+        let tokenizer = make_test_tokenizer(weights.vocab_size);
+        let result = run_memit_inner(&weights, &[], 1.0, RSource::EmbedShortcut(1.0), &tokenizer);
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_empty());
+    }
+
+    // ── MemitResult delta shape ────────────────────────────────────────────────
+
+    #[test]
+    fn memit_result_delta_w_shape_matches_weights() {
+        // Build a synthetic MemitResult and verify expected shapes.
+        let weights = make_test_weights();
+        let delta = ndarray::Array2::zeros((weights.hidden_size, weights.intermediate_size));
+        let result = MemitResult {
+            layer: 0,
+            delta_w: delta.clone(),
+            fact_results: vec![],
+        };
+        assert_eq!(
+            result.delta_w.shape(),
+            &[weights.hidden_size, weights.intermediate_size]
+        );
+    }
+
+    // ── Real-model MEMIT (requires LARQL_VINDEX_PATH + LARQL_TOKENIZER_PATH) ──
+    //
+    // Run with:
+    //   LARQL_VINDEX_PATH=/path/to/vindex.vindex \
+    //   cargo test -p larql-inference --lib forward::memit::tests -- --ignored --nocapture
+
+    #[test]
+    #[ignore = "requires LARQL_VINDEX_PATH pointing to a non-Q4K vindex with model weights"]
+    fn run_memit_single_fact_produces_delta() {
+        let vpath = std::env::var("LARQL_VINDEX_PATH").expect("LARQL_VINDEX_PATH not set");
+        let path = std::path::Path::new(&vpath);
+        let mut cb = larql_vindex::SilentLoadCallbacks;
+        let weights = larql_vindex::load_model_weights(path, &mut cb).expect("weights load failed");
+        let tokenizer = larql_vindex::load_vindex_tokenizer(path).expect("tokenizer load failed");
+
+        let enc = tokenizer.encode("The capital of France is", true).unwrap();
+        let fact = MemitFact {
+            prompt_tokens: enc.get_ids().to_vec(),
+            target_token_id: tokenizer.token_to_id("Paris").unwrap_or(1),
+            layer: weights.num_layers - 1,
+            label: "france->paris".into(),
+        };
+
+        let result = run_memit(&weights, &[fact], 1.0, 1.0, &tokenizer);
+        let results = result.expect("MEMIT should succeed");
+        assert!(!results.is_empty(), "should get at least one result");
+        let r = &results[0];
+        assert_eq!(
+            r.delta_w.shape(),
+            &[weights.hidden_size, weights.intermediate_size]
+        );
+        eprintln!(
+            "delta_w norm: {:.4}",
+            r.delta_w.iter().map(|v| v * v).sum::<f32>().sqrt()
+        );
     }
 }

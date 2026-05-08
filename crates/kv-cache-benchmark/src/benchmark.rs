@@ -1,7 +1,6 @@
 /// Benchmark runner: sweeps context lengths × strategies × models.
 /// Outputs JSON + formatted table.
-
-use crate::{KvStrategy, StrategyResult, run_strategy_benchmark, model_config::ModelConfig};
+use crate::{model_config::ModelConfig, run_strategy_benchmark, KvStrategy, StrategyResult};
 use rand::prelude::*;
 
 /// Context lengths to sweep.
@@ -115,15 +114,14 @@ pub fn multi_turn_simulation(
     results
 }
 
-/// Format results as a comparative table (the video frame).
-pub fn format_comparative_table(
-    config: &ModelConfig,
-    strategies: &[&dyn KvStrategy],
-) -> String {
+/// Format the memory-scaling table (per-strategy × context length).
+pub fn format_comparative_table(config: &ModelConfig, strategies: &[&dyn KvStrategy]) -> String {
     let mut out = String::new();
-    out.push_str(&format!("\n=== KV Cache Strategy Comparison: {} ===\n\n", config.name));
+    out.push_str(&format!(
+        "\n=== KV Cache Strategy Comparison: {} ===\n\n",
+        config.name
+    ));
 
-    // Dynamic header based on number of strategies
     let col_width = 15;
     out.push_str(&format!("{:<25}", "Context Length"));
     for s in strategies {
@@ -137,34 +135,13 @@ pub fn format_comparative_table(
         out.push_str(&format!("{:<25}", format_tokens(seq_len)));
         for strategy in strategies {
             let mem = strategy.memory_bytes(config, seq_len);
-            out.push_str(&format!(" {:>width$}", format_bytes(mem), width = col_width));
+            out.push_str(&format!(
+                " {:>width$}",
+                format_bytes(mem),
+                width = col_width
+            ));
         }
         out.push('\n');
-    }
-
-    out.push_str("\n--- Computation per token ---\n\n");
-    // 5-column computation table
-    let ops = [
-        ("Attention matmul", "34 layers", "34 layers", "window only", "~1-2L dynamic", "ELIMINATED"),
-        ("FFN matmul",       "34 layers", "34 layers", "34 layers",   "ZERO (vindex)", "ELIMINATED"),
-        ("Logits matmul",    "1x",        "1x",        "1x",          "ZERO (KNN)",    "ELIMINATED"),
-        ("KV cache write",   "34 layers", "34L + quant","none",       "~1-2L dynamic", "none"),
-        ("Cached attn",      "none",      "none",       "none",       "~32-33L",       "none"),
-        ("Graph lookup",     "none",      "none",       "none",       "34L FFN",       "3 per hop"),
-    ];
-
-    out.push_str(&format!(
-        "{:<20} {:>14} {:>14} {:>14} {:>14} {:>14}\n",
-        "Operation", "Standard KV", "TurboQuant", "Markov RS", "Hybrid RS+CA", "Graph Walk"
-    ));
-    out.push_str(&"-".repeat(92));
-    out.push('\n');
-
-    for (op, std, tq, mrs, hyb, gw) in &ops {
-        out.push_str(&format!(
-            "{:<20} {:>14} {:>14} {:>14} {:>14} {:>14}\n",
-            op, std, tq, mrs, hyb, gw,
-        ));
     }
 
     out

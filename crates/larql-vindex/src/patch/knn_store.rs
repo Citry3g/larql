@@ -7,13 +7,11 @@
 //!
 //! Port of Python `RetrievalVindex` from experiments/15_v11_model/vindex_build_wordnet_b.py.
 
-use std::sync::Mutex;
 use std::collections::{HashMap, HashSet};
-use std::io::{Read, Cursor};
-use std::path::Path;
+use std::sync::Mutex;
 
 use ndarray::{Array1, Array2};
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 
 /// A single entry in the retrieval-override KNN store.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -66,6 +64,7 @@ impl Default for KnnStore {
 
 impl KnnStore {
     /// Add an entry. The key is L2-normalized before storage.
+    #[allow(clippy::too_many_arguments)]
     pub fn add(
         &mut self,
         layer: usize,
@@ -118,14 +117,19 @@ impl KnnStore {
         self.entries.retain(|_, v| !v.is_empty());
     }
 
-    /// Top-1 KNN query at a layer. Returns (entry, cosine_score).
-    pub fn query_top1(&self, layer: usize, residual: &[f32]) -> Option<(KnnEntry, f32)> {
+    /// Top-1 KNN query at a layer. Returns (&entry, cosine_score).
+    pub fn query_top1(&self, layer: usize, residual: &[f32]) -> Option<(&KnnEntry, f32)> {
         let results = self.query_knn(layer, residual, 1);
         results.into_iter().next()
     }
 
-    /// Top-K KNN query at a layer. Returns Vec<(entry, cosine_score)> descending.
-    pub fn query_knn(&self, layer: usize, residual: &[f32], k: usize) -> Vec<(KnnEntry, f32)> {
+    /// Top-K KNN query at a layer. Returns Vec<(&entry, cosine_score)> descending.
+    ///
+    /// Returns borrowed references to stored entries; callers clone only the
+    /// fields they need. Cloning an entire `KnnEntry` duplicates the
+    /// `hidden_size`-wide `key` vector, which is the hot-path waste this
+    /// signature avoids.
+    pub fn query_knn(&self, layer: usize, residual: &[f32], k: usize) -> Vec<(&KnnEntry, f32)> {
         let entries = match self.entries.get(&layer) {
             Some(e) if !e.is_empty() => e,
             _ => return Vec::new(),
@@ -158,9 +162,10 @@ impl KnnStore {
         indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         indexed.truncate(k_eff);
 
-        indexed.into_iter().map(|(idx, score)| {
-            (entries[idx].clone(), score)
-        }).collect()
+        indexed
+            .into_iter()
+            .map(|(idx, score)| (&entries[idx], score))
+            .collect()
     }
 
     /// All entries for a given entity (for DESCRIBE). Returns (layer, &KnnEntry).
@@ -220,137 +225,16 @@ impl KnnStore {
         self.dirty.lock().unwrap().remove(&layer);
     }
 
-    // ── Serialization ──
-
-    /// Magic bytes for knn_store.bin format.
-    const MAGIC: &'static [u8; 4] = b"LKNN";
-    const VERSION: u32 = 1;
-
-    /// Save to binary format with f16 keys.
-    pub fn save(&self, path: &Path) -> Result<(), String> {
-        let mut buf = Vec::new();
-
-        // Header
-        buf.extend_from_slice(Self::MAGIC);
-        buf.extend_from_slice(&Self::VERSION.to_le_bytes());
-
-        // Infer dim from first entry
-        let dim = self.entries.values()
-            .flat_map(|v| v.first())
-            .map(|e| e.key.len())
-            .next()
-            .unwrap_or(0) as u32;
-        buf.extend_from_slice(&dim.to_le_bytes());
-
-        let num_layers = self.entries.len() as u32;
-        buf.extend_from_slice(&num_layers.to_le_bytes());
-
-        // Per layer
-        for (&layer, entries) in &self.entries {
-            buf.extend_from_slice(&(layer as u32).to_le_bytes());
-            buf.extend_from_slice(&(entries.len() as u32).to_le_bytes());
-
-            // Keys as f16 (flat: num_entries * dim)
-            for entry in entries {
-                for &v in &entry.key {
-                    let bits = larql_models::quant::half::f32_to_f16(v);
-                    buf.extend_from_slice(&bits.to_le_bytes());
-                }
-            }
-
-            // Target IDs
-            for entry in entries {
-                buf.extend_from_slice(&entry.target_id.to_le_bytes());
-            }
-
-            // Metadata as JSON blob per entry
-            for entry in entries {
-                let meta = serde_json::json!({
-                    "target_token": entry.target_token,
-                    "entity": entry.entity,
-                    "relation": entry.relation,
-                    "confidence": entry.confidence,
-                });
-                let meta_bytes = serde_json::to_vec(&meta)
-                    .map_err(|e| format!("json encode: {e}"))?;
-                buf.extend_from_slice(&(meta_bytes.len() as u32).to_le_bytes());
-                buf.extend_from_slice(&meta_bytes);
-            }
-        }
-
-        std::fs::write(path, &buf).map_err(|e| format!("write knn_store: {e}"))
-    }
-
-    /// Load from binary format.
-    pub fn load(path: &Path) -> Result<Self, String> {
-        let data = std::fs::read(path).map_err(|e| format!("read knn_store: {e}"))?;
-        let mut cursor = Cursor::new(data.as_slice());
-
-        let mut magic = [0u8; 4];
-        cursor.read_exact(&mut magic).map_err(|e| format!("read magic: {e}"))?;
-        if &magic != Self::MAGIC {
-            return Err(format!("bad magic: expected LKNN, got {:?}", magic));
-        }
-
-        let version = read_u32(&mut cursor)?;
-        if version != Self::VERSION {
-            return Err(format!("unsupported knn_store version: {version}"));
-        }
-
-        let dim = read_u32(&mut cursor)? as usize;
-        let num_layers = read_u32(&mut cursor)? as usize;
-
-        let mut entries = HashMap::new();
-        for _ in 0..num_layers {
-            let layer = read_u32(&mut cursor)? as usize;
-            let num_entries = read_u32(&mut cursor)? as usize;
-
-            // Keys (f16 → f32)
-            let mut keys = Vec::with_capacity(num_entries);
-            for _ in 0..num_entries {
-                let mut key = Vec::with_capacity(dim);
-                for _ in 0..dim {
-                    let bits = read_u16(&mut cursor)?;
-                    key.push(larql_models::quant::half::f16_to_f32(bits));
-                }
-                keys.push(key);
-            }
-
-            // Target IDs
-            let mut target_ids = Vec::with_capacity(num_entries);
-            for _ in 0..num_entries {
-                target_ids.push(read_u32(&mut cursor)?);
-            }
-
-            // Metadata JSON blobs
-            let mut layer_entries = Vec::with_capacity(num_entries);
-            for i in 0..num_entries {
-                let meta_len = read_u32(&mut cursor)? as usize;
-                let mut meta_bytes = vec![0u8; meta_len];
-                cursor.read_exact(&mut meta_bytes)
-                    .map_err(|e| format!("read meta: {e}"))?;
-                let meta: serde_json::Value = serde_json::from_slice(&meta_bytes)
-                    .map_err(|e| format!("json decode: {e}"))?;
-
-                layer_entries.push(KnnEntry {
-                    key: keys[i].clone(),
-                    target_id: target_ids[i],
-                    target_token: meta["target_token"].as_str().unwrap_or("").to_string(),
-                    entity: meta["entity"].as_str().unwrap_or("").to_string(),
-                    relation: meta["relation"].as_str().unwrap_or("").to_string(),
-                    confidence: meta["confidence"].as_f64().unwrap_or(1.0) as f32,
-                });
-            }
-
-            entries.insert(layer, layer_entries);
-        }
-
-        let all_layers: HashSet<usize> = entries.keys().copied().collect();
-        Ok(Self {
+    /// Construct from a fully-populated entries map. Used by
+    /// `super::knn_store_io::load`. Rebuilds `key_matrices` lazily on
+    /// first query.
+    pub(super) fn from_entries(entries: HashMap<usize, Vec<KnnEntry>>) -> Self {
+        let dirty = entries.keys().copied().collect();
+        Self {
             entries,
             key_matrices: Mutex::new(HashMap::new()),
-            dirty: Mutex::new(all_layers),
-        })
+            dirty: Mutex::new(dirty),
+        }
     }
 }
 
@@ -361,18 +245,6 @@ fn l2_normalize(v: &[f32]) -> Vec<f32> {
         return vec![0.0; v.len()];
     }
     v.iter().map(|x| x / norm).collect()
-}
-
-fn read_u32(cursor: &mut Cursor<&[u8]>) -> Result<u32, String> {
-    let mut buf = [0u8; 4];
-    cursor.read_exact(&mut buf).map_err(|e| format!("read u32: {e}"))?;
-    Ok(u32::from_le_bytes(buf))
-}
-
-fn read_u16(cursor: &mut Cursor<&[u8]>) -> Result<u16, String> {
-    let mut buf = [0u8; 2];
-    cursor.read_exact(&mut buf).map_err(|e| format!("read u16: {e}"))?;
-    Ok(u16::from_le_bytes(buf))
 }
 
 // ── Tests ──
@@ -391,14 +263,38 @@ mod tests {
         assert!(store.is_empty());
         assert_eq!(store.len(), 0);
 
-        store.add(26, make_key(8, 1.0), 42, "Paris".into(), "France".into(), "capital".into(), 1.0);
+        store.add(
+            26,
+            make_key(8, 1.0),
+            42,
+            "Paris".into(),
+            "France".into(),
+            "capital".into(),
+            1.0,
+        );
         assert_eq!(store.len(), 1);
         assert!(!store.is_empty());
 
-        store.add(26, make_key(8, 2.0), 43, "Berlin".into(), "Germany".into(), "capital".into(), 1.0);
+        store.add(
+            26,
+            make_key(8, 2.0),
+            43,
+            "Berlin".into(),
+            "Germany".into(),
+            "capital".into(),
+            1.0,
+        );
         assert_eq!(store.len(), 2);
 
-        store.add(10, make_key(8, 3.0), 44, "French".into(), "France".into(), "language".into(), 1.0);
+        store.add(
+            10,
+            make_key(8, 3.0),
+            44,
+            "French".into(),
+            "France".into(),
+            "language".into(),
+            1.0,
+        );
         assert_eq!(store.len(), 3);
         assert_eq!(store.layers(), vec![10, 26]);
     }
@@ -407,7 +303,15 @@ mod tests {
     fn test_query_top1_exact_match() {
         let mut store = KnnStore::default();
         let key = make_key(64, 1.0);
-        store.add(26, key.clone(), 42, "Paris".into(), "France".into(), "capital".into(), 1.0);
+        store.add(
+            26,
+            key.clone(),
+            42,
+            "Paris".into(),
+            "France".into(),
+            "capital".into(),
+            1.0,
+        );
 
         // Query with same key should return cosine ~1.0
         let result = store.query_top1(26, &key);
@@ -431,9 +335,33 @@ mod tests {
         let key1 = make_key(64, 1.0);
         let key2 = make_key(64, 2.0);
         let key3 = make_key(64, 3.0);
-        store.add(26, key1.clone(), 42, "Paris".into(), "France".into(), "capital".into(), 1.0);
-        store.add(26, key2.clone(), 43, "Berlin".into(), "Germany".into(), "capital".into(), 1.0);
-        store.add(26, key3.clone(), 44, "Rome".into(), "Italy".into(), "capital".into(), 1.0);
+        store.add(
+            26,
+            key1.clone(),
+            42,
+            "Paris".into(),
+            "France".into(),
+            "capital".into(),
+            1.0,
+        );
+        store.add(
+            26,
+            key2.clone(),
+            43,
+            "Berlin".into(),
+            "Germany".into(),
+            "capital".into(),
+            1.0,
+        );
+        store.add(
+            26,
+            key3.clone(),
+            44,
+            "Rome".into(),
+            "Italy".into(),
+            "capital".into(),
+            1.0,
+        );
 
         // Query with key1 — should return Paris first (exact match)
         let results = store.query_knn(26, &key1, 3);
@@ -445,9 +373,33 @@ mod tests {
     #[test]
     fn test_remove_by_entity() {
         let mut store = KnnStore::default();
-        store.add(26, make_key(8, 1.0), 42, "Paris".into(), "France".into(), "capital".into(), 1.0);
-        store.add(10, make_key(8, 2.0), 43, "French".into(), "France".into(), "language".into(), 1.0);
-        store.add(26, make_key(8, 3.0), 44, "Berlin".into(), "Germany".into(), "capital".into(), 1.0);
+        store.add(
+            26,
+            make_key(8, 1.0),
+            42,
+            "Paris".into(),
+            "France".into(),
+            "capital".into(),
+            1.0,
+        );
+        store.add(
+            10,
+            make_key(8, 2.0),
+            43,
+            "French".into(),
+            "France".into(),
+            "language".into(),
+            1.0,
+        );
+        store.add(
+            26,
+            make_key(8, 3.0),
+            44,
+            "Berlin".into(),
+            "Germany".into(),
+            "capital".into(),
+            1.0,
+        );
         assert_eq!(store.len(), 3);
 
         store.remove_by_entity("France");
@@ -459,7 +411,15 @@ mod tests {
     #[test]
     fn test_remove_by_entity_case_insensitive() {
         let mut store = KnnStore::default();
-        store.add(26, make_key(8, 1.0), 42, "Paris".into(), "France".into(), "capital".into(), 1.0);
+        store.add(
+            26,
+            make_key(8, 1.0),
+            42,
+            "Paris".into(),
+            "France".into(),
+            "capital".into(),
+            1.0,
+        );
         store.remove_by_entity("france");
         assert_eq!(store.len(), 0);
     }
@@ -467,9 +427,33 @@ mod tests {
     #[test]
     fn test_entries_for_entity() {
         let mut store = KnnStore::default();
-        store.add(10, make_key(8, 1.0), 42, "Paris".into(), "France".into(), "capital".into(), 1.0);
-        store.add(26, make_key(8, 2.0), 43, "French".into(), "France".into(), "language".into(), 1.0);
-        store.add(26, make_key(8, 3.0), 44, "Berlin".into(), "Germany".into(), "capital".into(), 1.0);
+        store.add(
+            10,
+            make_key(8, 1.0),
+            42,
+            "Paris".into(),
+            "France".into(),
+            "capital".into(),
+            1.0,
+        );
+        store.add(
+            26,
+            make_key(8, 2.0),
+            43,
+            "French".into(),
+            "France".into(),
+            "language".into(),
+            1.0,
+        );
+        store.add(
+            26,
+            make_key(8, 3.0),
+            44,
+            "Berlin".into(),
+            "Germany".into(),
+            "capital".into(),
+            1.0,
+        );
 
         let france = store.entries_for_entity("France");
         assert_eq!(france.len(), 2);
@@ -495,9 +479,33 @@ mod tests {
     #[test]
     fn test_save_load_roundtrip() {
         let mut store = KnnStore::default();
-        store.add(26, make_key(16, 1.0), 42, "Paris".into(), "France".into(), "capital".into(), 0.95);
-        store.add(26, make_key(16, 2.0), 43, "Berlin".into(), "Germany".into(), "capital".into(), 0.87);
-        store.add(10, make_key(16, 3.0), 44, "French".into(), "France".into(), "language".into(), 1.0);
+        store.add(
+            26,
+            make_key(16, 1.0),
+            42,
+            "Paris".into(),
+            "France".into(),
+            "capital".into(),
+            0.95,
+        );
+        store.add(
+            26,
+            make_key(16, 2.0),
+            43,
+            "Berlin".into(),
+            "Germany".into(),
+            "capital".into(),
+            0.87,
+        );
+        store.add(
+            10,
+            make_key(16, 3.0),
+            44,
+            "French".into(),
+            "France".into(),
+            "language".into(),
+            1.0,
+        );
 
         let dir = std::env::temp_dir().join("larql_knn_test");
         let _ = std::fs::create_dir_all(&dir);
@@ -519,7 +527,10 @@ mod tests {
         assert!(result.is_some());
         let (entry, score) = result.unwrap();
         assert_eq!(entry.target_token, "Paris");
-        assert!(score > 0.95, "expected high cosine after f16 round-trip, got {score}");
+        assert!(
+            score > 0.95,
+            "expected high cosine after f16 round-trip, got {score}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -527,7 +538,15 @@ mod tests {
     #[test]
     fn test_query_different_layer_empty() {
         let mut store = KnnStore::default();
-        store.add(26, make_key(8, 1.0), 42, "Paris".into(), "France".into(), "capital".into(), 1.0);
+        store.add(
+            26,
+            make_key(8, 1.0),
+            42,
+            "Paris".into(),
+            "France".into(),
+            "capital".into(),
+            1.0,
+        );
 
         // Query at layer 10 which has no entries
         let result = store.query_top1(10, &make_key(8, 1.0));
@@ -543,8 +562,24 @@ mod tests {
         let mut key2 = vec![0.0; 64];
         key2[1] = 1.0;
 
-        store.add(26, key1.clone(), 42, "Paris".into(), "France".into(), "capital".into(), 1.0);
-        store.add(26, key2.clone(), 43, "Berlin".into(), "Germany".into(), "capital".into(), 1.0);
+        store.add(
+            26,
+            key1.clone(),
+            42,
+            "Paris".into(),
+            "France".into(),
+            "capital".into(),
+            1.0,
+        );
+        store.add(
+            26,
+            key2.clone(),
+            43,
+            "Berlin".into(),
+            "Germany".into(),
+            "capital".into(),
+            1.0,
+        );
 
         // Query with key1 — should return Paris with score=1.0, Berlin with score=0.0
         let results = store.query_knn(26, &key1, 2);

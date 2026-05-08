@@ -11,8 +11,8 @@
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use larql_lql::{parse, Session};
 use larql_models::TopKEntry;
-use larql_vindex::{ExtractLevel, FeatureMeta, StorageDtype, VectorIndex, VindexConfig};
 use larql_vindex::ndarray::Array2;
+use larql_vindex::{ExtractLevel, FeatureMeta, StorageDtype, VectorIndex, VindexConfig};
 use std::path::{Path, PathBuf};
 
 // ── Synthetic vindex setup ──────────────────────────────────────────────
@@ -44,8 +44,22 @@ fn make_bench_vindex_dir(tag: &str) -> PathBuf {
     // 16 known content tokens so DESCRIBE / SELECT can match by
     // entity name.
     let content_tokens = [
-        "France", "Paris", "Germany", "Berlin", "Spain", "Madrid", "Italy", "Rome",
-        "Japan", "Tokyo", "China", "Beijing", "USA", "Washington", "UK", "London",
+        "France",
+        "Paris",
+        "Germany",
+        "Berlin",
+        "Spain",
+        "Madrid",
+        "Italy",
+        "Rome",
+        "Japan",
+        "Tokyo",
+        "China",
+        "Beijing",
+        "USA",
+        "Washington",
+        "UK",
+        "London",
     ];
     let mut down_meta = Vec::with_capacity(num_layers);
     for layer in 0..num_layers {
@@ -82,11 +96,14 @@ fn make_bench_vindex_dir(tag: &str) -> PathBuf {
         embed_scale: 1.0,
         extract_level: ExtractLevel::Browse,
         dtype: StorageDtype::F32,
+        quant: larql_vindex::QuantFormat::None,
         layer_bands: None,
         layers: Vec::new(),
         down_top_k: 1,
         has_model_weights: false,
         model_config: None,
+        fp4: None,
+        ffn_layout: None,
     };
     index.save_vindex(&dir, &mut config).unwrap();
 
@@ -99,7 +116,8 @@ fn make_bench_vindex_dir(tag: &str) -> PathBuf {
 
     // Stub tokenizer so USE / DESCRIBE / SELECT can find one if they
     // need it.
-    let tok_json = r#"{"version":"1.0","model":{"type":"BPE","vocab":{},"merges":[]},"added_tokens":[]}"#;
+    let tok_json =
+        r#"{"version":"1.0","model":{"type":"BPE","vocab":{},"merges":[]},"added_tokens":[]}"#;
     std::fs::write(dir.join("tokenizer.json"), tok_json).unwrap();
 
     dir

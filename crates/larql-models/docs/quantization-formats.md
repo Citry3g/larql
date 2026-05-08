@@ -34,9 +34,12 @@ let f32_vals = half::decode_f16(&f16_bytes);             // Vec<f32>
 let f32_vals = half::decode_bf16(&bf16_bytes);           // Vec<f32>
 ```
 
-## GGML Block Quantization (ggml.rs)
+## GGML Block Quantization (`quant/ggml/`)
 
-GGML uses block quantization: groups of 32 elements share a scale factor, reducing storage while preserving relative magnitudes within each block.
+GGML uses block quantization: groups of 32 or 256 elements share scale metadata,
+reducing storage while preserving relative magnitudes within each block. The
+loader currently dequantizes supported GGUF tensor types to f32 `ModelWeights`;
+the fused row operations documented here are available for compute-side use.
 
 ### Q4_0
 
@@ -92,6 +95,48 @@ Decoding: value = scale × int8_value.
 
 Higher quality than Q4 but 2x larger. Used for intermediate quantization in compute paths.
 
+### Q4_K
+
+```
+Super-block size: 256 elements
+Storage: 2 bytes (f16 d) + 2 bytes (f16 dmin) + 12 bytes (8 packed 6-bit scales+mins) + 128 bytes (nibbles) = 144 bytes
+Bits per weight: 4.5
+```
+
+8 sub-blocks of 32 elements each. Each sub-block has its own 6-bit scale and min derived from the 12-byte packed field. Used for gate/up projections in Q4_K_M GGUF mixes.
+
+### Q6_K
+
+```
+Super-block size: 256 elements
+Storage: 128 bytes (lower 4 bits) + 64 bytes (upper 2 bits) + 16 bytes (int8 scales) + 2 bytes (f16 d) = 210 bytes
+Bits per weight: 6.5625
+```
+
+6-bit signed quantization with int8 per-16-element scales. Highest precision K-quant; used for down projections in Q4_K_M.
+
+### K-quant API
+
+```rust
+use larql_models::quant::ggml::{q4_k, q6_k};
+
+// Fused decode + dot (no intermediate Vec allocation)
+let dot: f32 = q4_k::q4k_row_dot(&row_bytes, &x)?;
+let dot: f32 = q6_k::q6k_row_dot(&row_bytes, &x)?;
+
+// Fused decode + scaled-add: out += alpha * dequant(row)
+q4_k::q4k_row_scaled_add(&row_bytes, alpha, &mut out)?;
+q6_k::q6k_row_scaled_add(&row_bytes, alpha, &mut out)?;
+
+// Full dequantize to Vec<f32>
+let vals = q4_k::dequantize_q4_k(&bytes, num_elements)?;
+let vals = q6_k::dequantize_q6_k(&bytes, num_elements)?;
+```
+
+On aarch64, `q4k_row_dot` and `q6k_row_dot` use NEON SIMD; other targets fall
+back to scalar. Tests assert NEON and scalar parity, plus fused row-dot and
+scaled-add agreement with full dequantization.
+
 ### API
 
 ```rust
@@ -101,13 +146,15 @@ use larql_models::quant::ggml;
 let q4_bytes = ggml::quantize_q4_0(&f32_data);      // f32 → packed Q4_0
 let q8_bytes = ggml::quantize_q8_0(&f32_data);      // f32 → packed Q8_0
 
-// Dequantize (any supported type)
+// Dequantize (any supported type). Returns ModelError::Parse if `bytes`
+// is shorter than the declared element count implies, or if num_elements
+// is not a multiple of the block size (32 for Q4/Q5/Q8, 256 for Q4_K/Q6_K).
 let f32_data = ggml::dequantize(&bytes, ggml::TYPE_Q4_0, num_elements)?;
 let f32_data = ggml::dequantize_q4_0(&bytes, num_elements)?;  // type-specific
 
 // Format info
-let size = ggml::tensor_data_size(ggml::TYPE_Q4_0, 1024);  // bytes for 1024 elements
-let name = ggml::type_name(ggml::TYPE_Q8_0);                // "Q8_0"
+let size = ggml::tensor_data_size(ggml::TYPE_Q4_K, 1024);  // bytes for 1024 elements
+let name = ggml::type_name(ggml::TYPE_Q6_K);                // "Q6_K"
 ```
 
 ### Type Constants
@@ -124,6 +171,10 @@ let name = ggml::type_name(ggml::TYPE_Q8_0);                // "Q8_0"
 | `TYPE_Q4_K` | 12 | Q4_K |
 | `TYPE_Q6_K` | 14 | Q6_K |
 | `TYPE_BF16` | 30 | BF16 |
+
+`TYPE_Q2_K`, `TYPE_Q3_K`, and `TYPE_Q5_K` names are recognized for diagnostics
+and sizing compatibility, but they are not dequantized yet; dispatch returns
+`ModelError::UnsupportedDtype` for unsupported GGML types.
 
 ## MXFP4 (mxfp4.rs)
 
@@ -177,11 +228,25 @@ Final value = e8m0_scale × fp4_value.
 use larql_models::quant::mxfp4;
 
 let scale = mxfp4::e8m0_to_f32(128);  // 2.0
-let value = mxfp4::fp4_to_f32(0x5);   // 3.0
 
-// Dequantize a block (scale_byte + 16 value bytes → 32 f32s)
-let f32_block = mxfp4::dequantize_block(scale_byte, &value_bytes);
+// Dequantize a single expert's projection:
+//   blocks = out_features × groups × 16 bytes (each byte = 2 × 4-bit values)
+//   scales = out_features × groups bytes (one e8m0 per group of 32 elements)
+let f32_row = mxfp4::dequantize_expert(&blocks, &scales, out_features, groups)?;
+
+// Dequantize all experts from packed [num_experts, out_features, groups, 16] tensors:
+let experts: Vec<Vec<f32>> =
+    mxfp4::dequantize_all_experts(&blocks, &scales, num_experts, out_features, groups)?;
+
+// Split GPT-OSS fused gate_up tensor into separate gate (w1) and up (w3) per-expert matrices.
+// out_features = 2 × hidden (gate and up fused row-wise); splits at the midpoint.
+let (gate_experts, up_experts): (ExpertWeights, ExpertWeights) =
+    mxfp4::split_gate_up_experts(&blocks, &scales, num_experts, out_features, groups)?;
 ```
+
+All functions return `ModelError::Parse` if `blocks` or `scales` is too short
+for the declared shape — truncated inputs surface as clean errors rather than
+panicking on a slice OOB.
 
 ## Size Comparison
 
@@ -192,8 +257,10 @@ For a 10240×2560 FFN weight matrix (26.2M elements):
 | f32 | 105 MB | 1.0x |
 | f16 | 52.4 MB | 0.50x |
 | Q8_0 | 27.9 MB | 0.27x |
+| Q6_K | 21.4 MB | 0.20x |
 | Q5_1 | 19.7 MB | 0.19x |
 | Q5_0 | 18.0 MB | 0.17x |
+| Q4_K | 14.6 MB | 0.14x |
 | Q4_1 | 16.4 MB | 0.16x |
 | Q4_0 | 14.7 MB | 0.14x |
 | MXFP4 | 13.9 MB | 0.13x |

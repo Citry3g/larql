@@ -2,11 +2,10 @@
 ///
 /// Tier A: cached template walk — known template, entity KNN only (<0.1ms)
 /// Tier B: dynamic graph walk — full routing table lookup (~1-5ms)
-/// Tier C: hybrid fallback — fall back to Markov RS / forward pass (~200ms)
+/// Tier C: Markov RS fallback — full RS forward pass for free-form generation (~200ms)
 ///
 /// The benchmark reports what % of queries resolve at each tier
 /// and the accuracy per tier vs full forward pass baseline.
-
 use super::walk_state::{WalkState, WalkTier};
 
 /// Result of tier-based routing.
@@ -33,11 +32,11 @@ pub fn route_to_tier(state: &WalkState) -> TierResult {
             resolved: true,
             description: "Dynamic graph walk: full routing table lookup",
         },
-        WalkTier::HybridFallback => TierResult {
-            tier: WalkTier::HybridFallback,
+        WalkTier::MarkovFallback => TierResult {
+            tier: WalkTier::MarkovFallback,
             latency_us: state.estimated_latency_us(),
-            resolved: false, // Falls back to Markov RS
-            description: "Hybrid fallback: Markov RS forward pass",
+            resolved: false,
+            description: "Markov RS fallback: full RS forward pass",
         },
     }
 }
@@ -65,7 +64,7 @@ impl TierDistribution {
             match state.tier {
                 WalkTier::CachedTemplate => dist.tier_a_count += 1,
                 WalkTier::DynamicWalk => dist.tier_b_count += 1,
-                WalkTier::HybridFallback => dist.tier_c_count += 1,
+                WalkTier::MarkovFallback => dist.tier_c_count += 1,
             }
             total_latency += state.estimated_latency_us();
         }
@@ -77,22 +76,34 @@ impl TierDistribution {
     }
 
     pub fn tier_a_pct(&self) -> f64 {
-        if self.total == 0 { 0.0 } else { self.tier_a_count as f64 / self.total as f64 * 100.0 }
+        if self.total == 0 {
+            0.0
+        } else {
+            self.tier_a_count as f64 / self.total as f64 * 100.0
+        }
     }
 
     pub fn tier_b_pct(&self) -> f64 {
-        if self.total == 0 { 0.0 } else { self.tier_b_count as f64 / self.total as f64 * 100.0 }
+        if self.total == 0 {
+            0.0
+        } else {
+            self.tier_b_count as f64 / self.total as f64 * 100.0
+        }
     }
 
     pub fn tier_c_pct(&self) -> f64 {
-        if self.total == 0 { 0.0 } else { self.tier_c_count as f64 / self.total as f64 * 100.0 }
+        if self.total == 0 {
+            0.0
+        } else {
+            self.tier_c_count as f64 / self.total as f64 * 100.0
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::walk_state::WalkMode;
+    use super::*;
 
     #[test]
     fn test_tier_routing() {
@@ -110,7 +121,7 @@ mod tests {
             last_entity: None,
             current_relation: None,
             mode: WalkMode::Conversation,
-            tier: WalkTier::HybridFallback,
+            tier: WalkTier::MarkovFallback,
         };
         let result = route_to_tier(&fallback);
         assert!(!result.resolved);

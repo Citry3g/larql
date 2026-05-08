@@ -1,17 +1,32 @@
 //! f16/bf16 ↔ f32 conversion.
 
 /// Convert f16 bits to f32.
+///
+/// Subnormals are reconstructed as `m * 2^-24` where `m` is the 10-bit
+/// mantissa (no implicit leading 1). The previous normalisation formula
+/// `127 - 15 + 1 - e` produced values exactly 2× too small for every
+/// subnormal path — fine when all scales were normal floats (legacy quant
+/// settings), catastrophic once k-quant super-block scales were forced
+/// into f16 subnormal range by the corrected Q4_K/Q6_K scale formulas.
+/// The right formula is `114 - e`: for `e = shifts + 1`, we need f32
+/// biased exponent `127 + (-14 - shifts)` = `114 - e`.
+#[inline]
 pub fn f16_to_f32(bits: u16) -> f32 {
     let sign = ((bits >> 15) as u32) << 31;
     let exp = ((bits >> 10) & 0x1F) as u32;
     let mant = (bits & 0x3FF) as u32;
 
     if exp == 0 {
-        if mant == 0 { return f32::from_bits(sign); }
+        if mant == 0 {
+            return f32::from_bits(sign);
+        }
         let mut e = 1u32;
         let mut m = mant;
-        while (m & 0x400) == 0 { m <<= 1; e += 1; }
-        return f32::from_bits(sign | ((127 - 15 + 1 - e) << 23) | ((m & 0x3FF) << 13));
+        while (m & 0x400) == 0 {
+            m <<= 1;
+            e += 1;
+        }
+        return f32::from_bits(sign | ((114 - e) << 23) | ((m & 0x3FF) << 13));
     }
     if exp == 31 {
         return f32::from_bits(sign | (0xFF << 23) | (mant << 13));
@@ -35,8 +50,12 @@ pub fn f32_to_f16(value: f32) -> u16 {
         return sign | 0x7C00 | if mant != 0 { 0x0200 } else { 0 };
     }
     let exp16 = exp - 127 + 15;
-    if exp16 >= 31 { return sign | 0x7C00; }
-    if exp16 <= 0 { return sign; }
+    if exp16 >= 31 {
+        return sign | 0x7C00;
+    }
+    if exp16 <= 0 {
+        return sign;
+    }
     sign | ((exp16 as u16) << 10) | ((mant >> 13) as u16)
 }
 
@@ -86,8 +105,10 @@ mod tests {
         for &v in &[0.0f32, 1.0, -1.0, 0.5, 100.0, 2.71] {
             let bits = f32_to_f16(v);
             let back = f16_to_f32(bits);
-            assert!((v - back).abs() < 0.01 * v.abs().max(0.001),
-                "{v} → {bits} → {back}");
+            assert!(
+                (v - back).abs() < 0.01 * v.abs().max(0.001),
+                "{v} → {bits} → {back}"
+            );
         }
     }
 
@@ -96,8 +117,10 @@ mod tests {
         for &v in &[0.0f32, 1.0, -1.0, 0.5, 100.0, -42.0] {
             let bits = f32_to_bf16(v);
             let back = bf16_to_f32(bits);
-            assert!((v - back).abs() < 0.01 * v.abs().max(0.001),
-                "{v} → {bits} → {back}");
+            assert!(
+                (v - back).abs() < 0.01 * v.abs().max(0.001),
+                "{v} → {bits} → {back}"
+            );
         }
     }
 

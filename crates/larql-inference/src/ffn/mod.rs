@@ -1,22 +1,20 @@
 //! Feed-forward network computation — trait-based with pluggable backends.
 //!
-//! ## Production backends
-//! - [`WeightFfn`] — dense, architecture-correct (the ground truth)
-//! - [`SparseFfn`] — gate matmul + top-K sparse up/down
-//! - [`LayerFfnRouter`] — per-layer backend selection
-//! - [`HighwayFfn`] — returns zeros (skip FFN)
+//! Production: [`WalkFfn`](crate::vindex::WalkFfn) — the unified walk kernel.
+//! Full-K and sparse-K are the same code path parameterised by [`WalkFfnConfig`](crate::vindex::WalkFfnConfig).
 //!
-//! See also `WalkFfn` in `vector_index.rs` (delegates to WeightFfn + vindex trace).
-//!
-//! ## Experimental backends
-//! See `experimental/` for research backends developed during FFN optimization.
+//! Reference: [`WeightFfn`] + [`SparseFfn`] live here for correctness/bench
+//! comparison (see `examples/walk_correctness.rs`); they are not used in
+//! production dispatch.
 
-pub mod weight;
+pub mod graph_backend;
+pub mod moe_remote;
+pub mod remote;
 pub mod sparse;
 pub mod sparse_compute;
-pub mod experimental;
 #[cfg(test)]
 mod tests;
+pub mod weight;
 
 use ndarray::Array2;
 
@@ -32,16 +30,31 @@ pub trait FfnBackend {
 
     /// Human-readable name for logging.
     fn name(&self) -> &str;
+
+    /// For hybrid MoE layers: receive `h_post_attn` (post-attention, pre-FFN,
+    /// unnormalized) and return the full layer output `h_out`. Returns `None`
+    /// to fall back to local dispatch.
+    fn forward_moe_full_layer(
+        &self,
+        _layer: usize,
+        _h_post_attn: &larql_vindex::ndarray::Array2<f32>,
+    ) -> Option<larql_vindex::ndarray::Array2<f32>> {
+        None
+    }
 }
 
 // ── Re-exports ──
 
-pub use weight::WeightFfn;
+pub use moe_remote::{MoeRouterWeights, RemoteMoeBackend, RemoteMoeError, ShardConfig};
+pub use remote::{
+    LayerShardedBackend, RemoteFfnConfig, RemoteFfnError, RemoteLatencyStats, RemoteWalkBackend,
+};
 pub use sparse::SparseFfn;
 pub use sparse_compute::{
-    sparse_ffn_forward, sparse_ffn_forward_with_overrides,
-    sparse_ffn_forward_with_full_overrides, FeatureSlotOverride,
+    sparse_ffn_forward, sparse_ffn_forward_with_full_overrides, sparse_ffn_forward_with_overrides,
+    FeatureSlotOverride,
 };
+pub use weight::{dense_ffn_forward_backend, BackendFfn, WeightFfn};
 
 // ── Per-layer backend selection ──
 
@@ -53,33 +66,27 @@ pub struct LayerFfnRouter<'a> {
 
 impl<'a> LayerFfnRouter<'a> {
     pub fn uniform(backend: &'a dyn FfnBackend, num_layers: usize) -> Self {
-        Self { backends: vec![backend; num_layers], num_layers }
+        Self {
+            backends: vec![backend; num_layers],
+            num_layers,
+        }
     }
 
     pub fn per_layer(backends: Vec<&'a dyn FfnBackend>) -> Self {
         let num_layers = backends.len();
-        Self { backends, num_layers }
+        Self {
+            backends,
+            num_layers,
+        }
     }
 
     pub fn get(&self, layer: usize) -> &dyn FfnBackend {
-        if layer < self.num_layers { self.backends[layer] }
-        else { self.backends[self.num_layers - 1] }
+        if layer < self.num_layers {
+            self.backends[layer]
+        } else {
+            self.backends[self.num_layers - 1]
+        }
     }
-}
-
-// ── Highway backend ──
-
-/// Returns zeros. Skips FFN computation; attention still runs.
-pub struct HighwayFfn;
-
-impl FfnBackend for HighwayFfn {
-    fn forward(&self, _layer: usize, x: &Array2<f32>) -> Array2<f32> {
-        Array2::<f32>::zeros((x.shape()[0], x.shape()[1]))
-    }
-    fn forward_with_activation(&self, _layer: usize, x: &Array2<f32>) -> (Array2<f32>, Array2<f32>) {
-        (Array2::<f32>::zeros((x.shape()[0], x.shape()[1])), Array2::<f32>::zeros((x.shape()[0], 1)))
-    }
-    fn name(&self) -> &str { "highway" }
 }
 
 // ── Activation functions ──

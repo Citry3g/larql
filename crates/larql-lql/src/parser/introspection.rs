@@ -1,8 +1,8 @@
 //! Introspection statement parsers: SHOW (RELATIONS, LAYERS, FEATURES, MODELS), STATS.
 
+use super::{ParseError, Parser};
 use crate::ast::*;
 use crate::lexer::{Keyword, Token};
-use super::{Parser, ParseError};
 
 impl Parser {
     pub(crate) fn parse_show(&mut self) -> Result<Statement, ParseError> {
@@ -109,8 +109,14 @@ impl Parser {
                 self.eat_semicolon();
                 Ok(Statement::ShowPatches)
             }
+            Token::Keyword(Keyword::Compact) => {
+                self.advance();
+                self.expect_keyword(Keyword::Status)?;
+                self.eat_semicolon();
+                Ok(Statement::ShowCompactStatus)
+            }
             _ => Err(ParseError(format!(
-                "expected RELATIONS, LAYERS, FEATURES, ENTITIES, MODELS, or PATCHES after SHOW, got {:?}",
+                "expected RELATIONS, LAYERS, FEATURES, ENTITIES, MODELS, PATCHES, or COMPACT after SHOW, got {:?}",
                 self.peek()
             ))),
         }

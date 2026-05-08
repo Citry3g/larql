@@ -37,16 +37,25 @@ impl Parser {
 
     pub fn parse(&mut self) -> Result<Statement, ParseError> {
         let stmt = self.parse_statement()?;
-        if self.check_pipe() {
+        let stmt = if self.check_pipe() {
             self.advance();
             let right = self.parse_statement()?;
-            Ok(Statement::Pipe {
+            Statement::Pipe {
                 left: Box::new(stmt),
                 right: Box::new(right),
-            })
+            }
         } else {
-            Ok(stmt)
+            stmt
+        };
+
+        if !matches!(self.peek(), Token::Eof) {
+            return Err(ParseError(format!(
+                "unexpected trailing token: {:?}",
+                self.peek()
+            )));
         }
+
+        Ok(stmt)
     }
 
     fn parse_statement(&mut self) -> Result<Statement, ParseError> {
@@ -64,6 +73,7 @@ impl Parser {
             Token::Keyword(Keyword::Delete) => self.parse_delete(),
             Token::Keyword(Keyword::Update) => self.parse_update(),
             Token::Keyword(Keyword::Merge) => self.parse_merge(),
+            Token::Keyword(Keyword::Rebalance) => self.parse_rebalance(),
             Token::Keyword(Keyword::Show) => self.parse_show(),
             Token::Keyword(Keyword::Stats) => self.parse_stats(),
             Token::Keyword(Keyword::Begin) => self.parse_begin(),
@@ -71,6 +81,7 @@ impl Parser {
             Token::Keyword(Keyword::Apply) => self.parse_apply(),
             Token::Keyword(Keyword::Remove) => self.parse_remove(),
             Token::Keyword(Keyword::Trace) => self.parse_trace(),
+            Token::Keyword(Keyword::Compact) => self.parse_compact(),
             _ => Err(ParseError(format!(
                 "expected statement keyword, got {:?}",
                 self.peek()

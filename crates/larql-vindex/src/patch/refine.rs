@@ -69,10 +69,7 @@ pub struct RefineResult {
 /// install layer, which is what `larql-inference` produces.
 ///
 /// Empty input returns an empty result with `median_retained = 1.0`.
-pub fn refine_gates(
-    inputs: &[RefineInput],
-    decoy_residuals: &[Array1<f32>],
-) -> RefineResult {
+pub fn refine_gates(inputs: &[RefineInput], decoy_residuals: &[Array1<f32>]) -> RefineResult {
     if inputs.is_empty() {
         return RefineResult {
             gates: Vec::new(),
@@ -138,18 +135,45 @@ pub fn refine_gates(
     }
 }
 
-/// Gram-Schmidt: remove the projection of `target` onto every vector in
-/// `suppress`, one at a time. The order matters in principle but for
-/// well-conditioned suppression sets the result is stable.
+/// Project `target` onto the orthogonal complement of `span(suppress)`.
+///
+/// Does proper modified Gram-Schmidt: first orthonormalises the
+/// suppress vectors (so correlated vectors don't lead to incorrect
+/// projections), then subtracts each orthonormal component from the
+/// target. With an orthonormal basis `q_1..q_k` of `span(suppress)`,
+/// the result `v = target - Σ (target·q_i) q_i` is exactly orthogonal
+/// to every original suppress vector — even when the suppress set was
+/// highly correlated (cos ~ 0.99 at compose-time on Gemma L26).
+///
+/// The naive single-pass version (`v -= (v·u)/||u||² · u` for each raw
+/// `u`) only guarantees `v ⊥ u_last`; earlier orthogonality is lost as
+/// later projections re-introduce components. At N=50 with correlated
+/// template-dominated residuals this produced cross-slot interference
+/// strong enough to collapse compose to ~10 usable facts.
 fn orthogonalise(target: &Array1<f32>, suppress: &[&Array1<f32>]) -> Array1<f32> {
-    let mut v = target.clone();
+    // Step 1: build an orthonormal basis of span(suppress) via
+    // Gram-Schmidt over the suppress set itself. Numerical
+    // near-dependencies are dropped (||q|| < 1e-6 after projection).
+    let mut basis: Vec<Array1<f32>> = Vec::with_capacity(suppress.len());
     for u in suppress {
-        let un = u.dot(*u).sqrt();
-        if un < 1e-8 {
-            continue;
+        let mut q = (*u).clone();
+        for b in &basis {
+            let coef = q.dot(b);
+            q = &q - &(coef * b);
         }
-        let coef = v.dot(*u) / (un * un);
-        v = &v - &(coef * *u);
+        let qn = q.dot(&q).sqrt();
+        if qn > 1e-6 {
+            q.mapv_inplace(|v| v / qn);
+            basis.push(q);
+        }
+    }
+
+    // Step 2: project target onto the orthogonal complement of
+    // span(suppress) = span(basis).
+    let mut v = target.clone();
+    for q in &basis {
+        let coef = v.dot(q);
+        v = &v - &(coef * q);
     }
     v
 }
@@ -176,8 +200,16 @@ mod tests {
         // Two unit vectors that are already orthogonal — refine should
         // not change them and retained_norm should be ~1.0 for both.
         let inputs = vec![
-            RefineInput { layer: 0, feature: 0, gate: vec(&[1.0, 0.0, 0.0]) },
-            RefineInput { layer: 0, feature: 1, gate: vec(&[0.0, 1.0, 0.0]) },
+            RefineInput {
+                layer: 0,
+                feature: 0,
+                gate: vec(&[1.0, 0.0, 0.0]),
+            },
+            RefineInput {
+                layer: 0,
+                feature: 1,
+                gate: vec(&[0.0, 1.0, 0.0]),
+            },
         ];
         let r = refine_gates(&inputs, &[]);
         assert!((r.gates[0].retained_norm - 1.0).abs() < 1e-5);
@@ -191,15 +223,26 @@ mod tests {
         // Two parallel vectors — the second one should be projected to
         // (almost) zero after refining against the first.
         let inputs = vec![
-            RefineInput { layer: 0, feature: 0, gate: vec(&[1.0, 0.0]) },
-            RefineInput { layer: 0, feature: 1, gate: vec(&[2.0, 0.0]) },
+            RefineInput {
+                layer: 0,
+                feature: 0,
+                gate: vec(&[1.0, 0.0]),
+            },
+            RefineInput {
+                layer: 0,
+                feature: 1,
+                gate: vec(&[2.0, 0.0]),
+            },
         ];
         let r = refine_gates(&inputs, &[]);
         // The first fact projects out the second, and vice-versa. Both
         // collapse because they share the same direction and there is
         // nothing else to anchor on.
-        assert!(r.gates[0].retained_norm < 0.01,
-                "first fact retained norm {} should be ~0", r.gates[0].retained_norm);
+        assert!(
+            r.gates[0].retained_norm < 0.01,
+            "first fact retained norm {} should be ~0",
+            r.gates[0].retained_norm
+        );
         assert!(r.gates[1].retained_norm < 0.01);
     }
 
@@ -215,33 +258,53 @@ mod tests {
         // retained_norm < 1.0 — and that's what the executor uses for
         // its alpha-effective accounting.
         let inputs = vec![
-            RefineInput { layer: 0, feature: 0, gate: vec(&[1.0, 0.5, 0.0, 0.0]) },
-            RefineInput { layer: 0, feature: 1, gate: vec(&[0.5, 1.0, 0.0, 0.0]) },
+            RefineInput {
+                layer: 0,
+                feature: 0,
+                gate: vec(&[1.0, 0.5, 0.0, 0.0]),
+            },
+            RefineInput {
+                layer: 0,
+                feature: 1,
+                gate: vec(&[0.5, 1.0, 0.0, 0.0]),
+            },
         ];
         let r = refine_gates(&inputs, &[]);
-        assert!(r.gates[0].retained_norm < 1.0,
-                "fact 0 should lose norm to peer projection, got {}",
-                r.gates[0].retained_norm);
+        assert!(
+            r.gates[0].retained_norm < 1.0,
+            "fact 0 should lose norm to peer projection, got {}",
+            r.gates[0].retained_norm
+        );
         assert!(r.gates[1].retained_norm < 1.0);
-        assert!(r.gates[0].retained_norm > 0.1,
-                "fact 0 collapsed too far ({}), peers aren't parallel",
-                r.gates[0].retained_norm);
+        assert!(
+            r.gates[0].retained_norm > 0.1,
+            "fact 0 collapsed too far ({}), peers aren't parallel",
+            r.gates[0].retained_norm
+        );
     }
 
     #[test]
     fn decoy_residuals_remove_decoy_overlap() {
         // A single fact with overlap onto a decoy direction should
         // lose that overlap after refining against the decoy.
-        let inputs = vec![
-            RefineInput { layer: 0, feature: 0, gate: vec(&[1.0, 0.5]) },
-        ];
+        let inputs = vec![RefineInput {
+            layer: 0,
+            feature: 0,
+            gate: vec(&[1.0, 0.5]),
+        }];
         let decoy = vec(&[0.0, 1.0]);
         let cos_before = cos(&inputs[0].gate, &decoy);
         let r = refine_gates(&inputs, std::slice::from_ref(&decoy));
         let cos_after = cos(&r.gates[0].gate, &decoy);
-        assert!(cos_after.abs() < 1e-5,
-                "decoy overlap should drop to ~0, got {}", cos_after.abs());
-        assert!(cos_before.abs() > 0.1, "test setup broken: no overlap to start");
+        assert!(
+            cos_after.abs() < 1e-5,
+            "decoy overlap should drop to ~0, got {}",
+            cos_after.abs()
+        );
+        assert!(
+            cos_before.abs() > 0.1,
+            "test setup broken: no overlap to start"
+        );
     }
 
     #[test]
@@ -249,8 +312,16 @@ mod tests {
         // Two facts at different layers that share a direction should
         // both retain their full norm — refine never crosses layers.
         let inputs = vec![
-            RefineInput { layer: 5, feature: 0, gate: vec(&[1.0, 0.0]) },
-            RefineInput { layer: 9, feature: 1, gate: vec(&[1.0, 0.0]) },
+            RefineInput {
+                layer: 5,
+                feature: 0,
+                gate: vec(&[1.0, 0.0]),
+            },
+            RefineInput {
+                layer: 9,
+                feature: 1,
+                gate: vec(&[1.0, 0.0]),
+            },
         ];
         let r = refine_gates(&inputs, &[]);
         assert!((r.gates[0].retained_norm - 1.0).abs() < 1e-5);
@@ -260,9 +331,21 @@ mod tests {
     #[test]
     fn summary_stats_are_sensible() {
         let inputs = vec![
-            RefineInput { layer: 0, feature: 0, gate: vec(&[1.0, 0.0, 0.0]) },
-            RefineInput { layer: 0, feature: 1, gate: vec(&[0.5, 0.5, 0.0]) },
-            RefineInput { layer: 0, feature: 2, gate: vec(&[0.1, 0.1, 1.0]) },
+            RefineInput {
+                layer: 0,
+                feature: 0,
+                gate: vec(&[1.0, 0.0, 0.0]),
+            },
+            RefineInput {
+                layer: 0,
+                feature: 1,
+                gate: vec(&[0.5, 0.5, 0.0]),
+            },
+            RefineInput {
+                layer: 0,
+                feature: 2,
+                gate: vec(&[0.1, 0.1, 1.0]),
+            },
         ];
         let r = refine_gates(&inputs, &[]);
         assert_eq!(r.gates.len(), 3);
@@ -276,7 +359,11 @@ mod tests {
         // Smoke test that the API accepts the actual ndarray macros
         // (catches signature drift).
         let g = array![1.0_f32, 2.0, 3.0];
-        let inputs = vec![RefineInput { layer: 0, feature: 0, gate: g.clone() }];
+        let inputs = vec![RefineInput {
+            layer: 0,
+            feature: 0,
+            gate: g.clone(),
+        }];
         let r = refine_gates(&inputs, &[]);
         assert_eq!(r.gates[0].gate, g);
     }

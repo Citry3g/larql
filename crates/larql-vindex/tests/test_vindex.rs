@@ -1,9 +1,8 @@
 //! Tests for the larql-vindex crate.
 
-use larql_vindex::{
-    FeatureMeta, GateIndex, VectorIndex, VindexConfig, VindexLayerInfo,
-};
-use ndarray::{Array1, Array2, ArcArray2};
+use larql_vindex::format::filenames::*;
+use larql_vindex::{FeatureMeta, GateIndex, VectorIndex, VindexConfig, VindexLayerInfo};
+use ndarray::{ArcArray2, Array1, Array2};
 
 fn make_top_k(token: &str, id: u32, logit: f32) -> larql_models::TopKEntry {
     larql_models::TopKEntry {
@@ -396,13 +395,18 @@ fn save_and_load_down_meta_round_trip() {
         source: None,
         checksums: None,
         extract_level: larql_vindex::ExtractLevel::Browse,
-        dtype: larql_vindex::StorageDtype::F32,        layer_bands: None,
+        dtype: larql_vindex::StorageDtype::F32,
+        quant: larql_vindex::QuantFormat::None,
+        layer_bands: None,
         model_config: None,
+        fp4: None,
+        ffn_layout: None,
     };
     VectorIndex::save_config(&config, &dir).unwrap();
 
     // Write a minimal tokenizer (needed for binary down_meta loading)
-    let tok_json = r#"{"version":"1.0","model":{"type":"BPE","vocab":{},"merges":[]},"added_tokens":[]}"#;
+    let tok_json =
+        r#"{"version":"1.0","model":{"type":"BPE","vocab":{},"merges":[]},"added_tokens":[]}"#;
     std::fs::write(dir.join("tokenizer.json"), tok_json).unwrap();
 
     // Load it back via the proper load path
@@ -468,16 +472,34 @@ fn save_config_round_trip() {
         vocab_size: 100,
         embed_scale: 1.0,
         layers: vec![
-            VindexLayerInfo { layer: 0, num_features: 3, offset: 0, length: 48, num_experts: None, num_features_per_expert: None },
-            VindexLayerInfo { layer: 1, num_features: 3, offset: 48, length: 48, num_experts: None, num_features_per_expert: None },
+            VindexLayerInfo {
+                layer: 0,
+                num_features: 3,
+                offset: 0,
+                length: 48,
+                num_experts: None,
+                num_features_per_expert: None,
+            },
+            VindexLayerInfo {
+                layer: 1,
+                num_features: 3,
+                offset: 48,
+                length: 48,
+                num_experts: None,
+                num_features_per_expert: None,
+            },
         ],
         down_top_k: 10,
         has_model_weights: false,
         source: None,
         checksums: None,
         extract_level: larql_vindex::ExtractLevel::Browse,
-        dtype: larql_vindex::StorageDtype::F32,        layer_bands: None,
+        dtype: larql_vindex::StorageDtype::F32,
+        quant: larql_vindex::QuantFormat::None,
+        layer_bands: None,
         model_config: None,
+        fp4: None,
+        ffn_layout: None,
     };
 
     VectorIndex::save_config(&config, &dir).unwrap();
@@ -519,7 +541,8 @@ fn binary_down_meta_write_read_round_trip() {
             ]),
         ],
         1, // top_k = 1
-    ).unwrap();
+    )
+    .unwrap();
     assert_eq!(count, 4); // 2 + 2 (Nones don't count)
 
     // Verify file exists and is much smaller than JSONL would be
@@ -536,13 +559,22 @@ fn binary_down_meta_write_read_round_trip() {
     // verify the raw binary structure is correct
     let data = std::fs::read(&bin_path).unwrap();
     // Check magic
-    assert_eq!(u32::from_le_bytes([data[0], data[1], data[2], data[3]]), 0x444D4554);
+    assert_eq!(
+        u32::from_le_bytes([data[0], data[1], data[2], data[3]]),
+        0x444D4554
+    );
     // Check version
     assert_eq!(u32::from_le_bytes([data[4], data[5], data[6], data[7]]), 1);
     // Check num_layers
-    assert_eq!(u32::from_le_bytes([data[8], data[9], data[10], data[11]]), 2);
+    assert_eq!(
+        u32::from_le_bytes([data[8], data[9], data[10], data[11]]),
+        2
+    );
     // Check top_k
-    assert_eq!(u32::from_le_bytes([data[12], data[13], data[14], data[15]]), 1);
+    assert_eq!(
+        u32::from_le_bytes([data[12], data[13], data[14], data[15]]),
+        1
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -574,18 +606,14 @@ fn save_down_meta_writes_binary() {
 #[test]
 fn load_nonexistent_vindex_errors() {
     let mut cb = larql_vindex::SilentLoadCallbacks;
-    let result = VectorIndex::load_vindex(
-        std::path::Path::new("/nonexistent/fake.vindex"),
-        &mut cb,
-    );
+    let result =
+        VectorIndex::load_vindex(std::path::Path::new("/nonexistent/fake.vindex"), &mut cb);
     assert!(result.is_err());
 }
 
 #[test]
 fn load_nonexistent_config_errors() {
-    let result = larql_vindex::load_vindex_config(
-        std::path::Path::new("/nonexistent/fake.vindex"),
-    );
+    let result = larql_vindex::load_vindex_config(std::path::Path::new("/nonexistent/fake.vindex"));
     assert!(result.is_err());
 }
 
@@ -733,7 +761,9 @@ fn v2_config_full_round_trip() {
         vocab_size: 262144,
         embed_scale: 50.596,
         extract_level: larql_vindex::ExtractLevel::Inference,
-        dtype: larql_vindex::StorageDtype::F32,        layer_bands: Some(larql_vindex::LayerBands {
+        dtype: larql_vindex::StorageDtype::F32,
+        quant: larql_vindex::QuantFormat::None,
+        layer_bands: Some(larql_vindex::LayerBands {
             syntax: (0, 13),
             knowledge: (14, 27),
             output: (28, 33),
@@ -749,12 +779,20 @@ fn v2_config_full_round_trip() {
             rope_base: 10000.0,
             sliding_window: Some(1024),
             moe: None,
-            global_head_dim: None, num_global_kv_heads: None,
-            partial_rotary_factor: None, sliding_window_pattern: None,
-            layer_types: None, attention_k_eq_v: false,
-            num_kv_shared_layers: None, per_layer_embed_dim: None,
-            rope_local_base: None, query_pre_attn_scalar: None,
+            global_head_dim: None,
+            num_global_kv_heads: None,
+            partial_rotary_factor: None,
+            sliding_window_pattern: None,
+            layer_types: None,
+            attention_k_eq_v: false,
+            num_kv_shared_layers: None,
+            per_layer_embed_dim: None,
+            rope_local_base: None,
+            query_pre_attn_scalar: None,
+            final_logit_softcapping: None,
         }),
+        fp4: None,
+        ffn_layout: None,
     };
 
     VectorIndex::save_config(&config, &dir).unwrap();
@@ -767,7 +805,10 @@ fn v2_config_full_round_trip() {
     assert!(loaded.has_model_weights);
 
     let source = loaded.source.unwrap();
-    assert_eq!(source.huggingface_repo.as_deref(), Some("google/gemma-3-4b-it"));
+    assert_eq!(
+        source.huggingface_repo.as_deref(),
+        Some("google/gemma-3-4b-it")
+    );
     assert_eq!(source.huggingface_revision.as_deref(), Some("abc123"));
     assert_eq!(source.larql_version, "0.1.0");
 
@@ -807,7 +848,9 @@ fn v2_config_with_moe() {
         vocab_size: 32000,
         embed_scale: 64.0,
         extract_level: larql_vindex::ExtractLevel::Browse,
-        dtype: larql_vindex::StorageDtype::F32,        layer_bands: Some(larql_vindex::LayerBands::for_family("mixtral", 32).unwrap()),
+        dtype: larql_vindex::StorageDtype::F32,
+        quant: larql_vindex::QuantFormat::None,
+        layer_bands: Some(larql_vindex::LayerBands::for_family("mixtral", 32).unwrap()),
         layers: vec![],
         down_top_k: 10,
         has_model_weights: false,
@@ -823,13 +866,23 @@ fn v2_config_with_moe() {
                 top_k: 2,
                 shared_expert: false,
                 router_type: "top_k_softmax".into(),
+                moe_intermediate_size: None,
+                hybrid: false,
             }),
-            global_head_dim: None, num_global_kv_heads: None,
-            partial_rotary_factor: None, sliding_window_pattern: None,
-            layer_types: None, attention_k_eq_v: false,
-            num_kv_shared_layers: None, per_layer_embed_dim: None,
-            rope_local_base: None, query_pre_attn_scalar: None,
+            global_head_dim: None,
+            num_global_kv_heads: None,
+            partial_rotary_factor: None,
+            sliding_window_pattern: None,
+            layer_types: None,
+            attention_k_eq_v: false,
+            num_kv_shared_layers: None,
+            per_layer_embed_dim: None,
+            rope_local_base: None,
+            query_pre_attn_scalar: None,
+            final_logit_softcapping: None,
         }),
+        fp4: None,
+        ffn_layout: None,
     };
 
     VectorIndex::save_config(&config, &dir).unwrap();
@@ -860,20 +913,21 @@ fn moe_index_gate_knn_across_experts() {
     gate0[[0, 0]] = 10.0; // E0F0 responds to dim 0
     gate0[[1, 1]] = 10.0; // E0F1 responds to dim 1
     gate0[[2, 2]] = 10.0; // E0F2 responds to dim 2
-    // Expert 1
+                          // Expert 1
     gate0[[3, 3]] = 10.0; // E1F0 responds to dim 3
-    gate0[[4, 0]] = 5.0; gate0[[4, 3]] = 5.0; // E1F1 mixed
-    gate0[[5, 1]] = 3.0;  // E1F2 weak dim 1
+    gate0[[4, 0]] = 5.0;
+    gate0[[4, 3]] = 5.0; // E1F1 mixed
+    gate0[[5, 1]] = 3.0; // E1F2 weak dim 1
 
     let gate_vectors = vec![Some(gate0)];
 
     let meta0 = vec![
-        Some(make_meta("Paris", 100, 0.95)),    // E0F0
-        Some(make_meta("Berlin", 101, 0.92)),   // E0F1
-        Some(make_meta("Tokyo", 102, 0.88)),    // E0F2
-        Some(make_meta("London", 103, 0.90)),   // E1F0
-        Some(make_meta("Rome", 104, 0.85)),     // E1F1
-        Some(make_meta("Madrid", 105, 0.80)),   // E1F2
+        Some(make_meta("Paris", 100, 0.95)),  // E0F0
+        Some(make_meta("Berlin", 101, 0.92)), // E0F1
+        Some(make_meta("Tokyo", 102, 0.88)),  // E0F2
+        Some(make_meta("London", 103, 0.90)), // E1F0
+        Some(make_meta("Rome", 104, 0.85)),   // E1F1
+        Some(make_meta("Madrid", 105, 0.80)), // E1F2
     ];
     let down_meta = vec![Some(meta0)];
 
@@ -919,17 +973,17 @@ fn moe_layer_info_round_trip() {
         vocab_size: 100,
         embed_scale: 1.0,
         extract_level: larql_vindex::ExtractLevel::Browse,
-        dtype: larql_vindex::StorageDtype::F32,        layer_bands: larql_vindex::LayerBands::for_family("mixtral", 32),
-        layers: vec![
-            VindexLayerInfo {
-                layer: 0,
-                num_features: 24, // 8 experts × 3 features
-                offset: 0,
-                length: 384,
-                num_experts: Some(8),
-                num_features_per_expert: Some(3),
-            },
-        ],
+        dtype: larql_vindex::StorageDtype::F32,
+        quant: larql_vindex::QuantFormat::None,
+        layer_bands: larql_vindex::LayerBands::for_family("mixtral", 32),
+        layers: vec![VindexLayerInfo {
+            layer: 0,
+            num_features: 24, // 8 experts × 3 features
+            offset: 0,
+            length: 384,
+            num_experts: Some(8),
+            num_features_per_expert: Some(3),
+        }],
         down_top_k: 10,
         has_model_weights: false,
         model_config: Some(larql_vindex::VindexModelConfig {
@@ -944,13 +998,23 @@ fn moe_layer_info_round_trip() {
                 top_k: 2,
                 shared_expert: false,
                 router_type: "top_k_softmax".into(),
+                moe_intermediate_size: None,
+                hybrid: false,
             }),
-            global_head_dim: None, num_global_kv_heads: None,
-            partial_rotary_factor: None, sliding_window_pattern: None,
-            layer_types: None, attention_k_eq_v: false,
-            num_kv_shared_layers: None, per_layer_embed_dim: None,
-            rope_local_base: None, query_pre_attn_scalar: None,
+            global_head_dim: None,
+            num_global_kv_heads: None,
+            partial_rotary_factor: None,
+            sliding_window_pattern: None,
+            layer_types: None,
+            attention_k_eq_v: false,
+            num_kv_shared_layers: None,
+            per_layer_embed_dim: None,
+            rope_local_base: None,
+            query_pre_attn_scalar: None,
+            final_logit_softcapping: None,
         }),
+        fp4: None,
+        ffn_layout: None,
     };
 
     VectorIndex::save_config(&config, &dir).unwrap();
@@ -990,12 +1054,16 @@ fn layer_bands_config_round_trip() {
         source: None,
         checksums: None,
         extract_level: larql_vindex::ExtractLevel::Browse,
-        dtype: larql_vindex::StorageDtype::F32,        layer_bands: Some(larql_vindex::LayerBands {
+        dtype: larql_vindex::StorageDtype::F32,
+        quant: larql_vindex::QuantFormat::None,
+        layer_bands: Some(larql_vindex::LayerBands {
             syntax: (0, 13),
             knowledge: (14, 27),
             output: (28, 33),
         }),
         model_config: None,
+        fp4: None,
+        ffn_layout: None,
     };
 
     VectorIndex::save_config(&config, &dir).unwrap();
@@ -1038,7 +1106,10 @@ fn checksum_compute_and_verify() {
     // Corrupt a file
     std::fs::write(dir.join("gate_vectors.bin"), b"corrupted!").unwrap();
     let results = larql_vindex::checksums::verify_checksums(&dir, &checksums).unwrap();
-    let gate_result = results.iter().find(|(f, _)| f == "gate_vectors.bin").unwrap();
+    let gate_result = results
+        .iter()
+        .find(|(f, _)| f == "gate_vectors.bin")
+        .unwrap();
     assert!(!gate_result.1); // should fail
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -1053,7 +1124,10 @@ fn checksum_individual_file() {
     std::fs::write(dir.join("test.bin"), b"hello world").unwrap();
     let hash = larql_vindex::checksums::sha256_file(&dir.join("test.bin")).unwrap();
     // SHA256 of "hello world" is known
-    assert_eq!(hash, "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9");
+    assert_eq!(
+        hash,
+        "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -1065,7 +1139,10 @@ fn checksum_individual_file() {
 #[test]
 fn extract_level_serialization() {
     assert_eq!(format!("{}", larql_vindex::ExtractLevel::Browse), "browse");
-    assert_eq!(format!("{}", larql_vindex::ExtractLevel::Inference), "inference");
+    assert_eq!(
+        format!("{}", larql_vindex::ExtractLevel::Inference),
+        "inference"
+    );
     assert_eq!(format!("{}", larql_vindex::ExtractLevel::All), "all");
 
     // serde round-trip
@@ -1138,18 +1215,25 @@ fn source_provenance_round_trip() {
         vocab_size: 100,
         embed_scale: 1.0,
         extract_level: larql_vindex::ExtractLevel::All,
-        dtype: larql_vindex::StorageDtype::F32,        layer_bands: None,
+        dtype: larql_vindex::StorageDtype::F32,
+        quant: larql_vindex::QuantFormat::None,
+        layer_bands: None,
         layers: vec![],
         down_top_k: 10,
         has_model_weights: true,
         model_config: None,
+        fp4: None,
+        ffn_layout: None,
     };
 
     VectorIndex::save_config(&config, &dir).unwrap();
     let loaded = larql_vindex::load_vindex_config(&dir).unwrap();
 
     let src = loaded.source.unwrap();
-    assert_eq!(src.huggingface_repo.as_deref(), Some("google/gemma-3-4b-it"));
+    assert_eq!(
+        src.huggingface_repo.as_deref(),
+        Some("google/gemma-3-4b-it")
+    );
     assert_eq!(src.huggingface_revision.as_deref(), Some("abc123def456"));
     assert_eq!(src.safetensors_sha256.as_deref(), Some("deadbeef"));
     assert_eq!(src.extracted_at, "2026-04-01T12:00:00Z");
@@ -1186,6 +1270,8 @@ fn patch_save_and_load_round_trip() {
                 target: "Colchester".into(),
                 confidence: Some(0.85),
                 gate_vector_b64: None,
+                up_vector_b64: None,
+                down_vector_b64: None,
                 down_meta: Some(larql_vindex::patch::core::PatchDownMeta {
                     top_token: "Colchester".into(),
                     top_token_id: 42,
@@ -1238,18 +1324,18 @@ fn patched_vindex_overrides_base() {
         description: None,
         author: None,
         tags: vec![],
-        operations: vec![
-            larql_vindex::PatchOp::Update {
-                layer: 0,
-                feature: 0,
-                gate_vector_b64: None,
-                down_meta: Some(larql_vindex::patch::core::PatchDownMeta {
-                    top_token: "London".into(),
-                    top_token_id: 300,
-                    c_score: 0.99,
-                }),
-            },
-        ],
+        operations: vec![larql_vindex::PatchOp::Update {
+            layer: 0,
+            feature: 0,
+            gate_vector_b64: None,
+            up_vector_b64: None,
+            down_vector_b64: None,
+            down_meta: Some(larql_vindex::patch::core::PatchDownMeta {
+                top_token: "London".into(),
+                top_token_id: 300,
+                c_score: 0.99,
+            }),
+        }],
     };
     patched.apply_patch(patch);
 
@@ -1275,13 +1361,11 @@ fn patched_vindex_delete_hides_feature() {
         description: None,
         author: None,
         tags: vec![],
-        operations: vec![
-            larql_vindex::PatchOp::Delete {
-                layer: 0,
-                feature: 2,
-                reason: Some("test delete".into()),
-            },
-        ],
+        operations: vec![larql_vindex::PatchOp::Delete {
+            layer: 0,
+            feature: 2,
+            reason: Some("test delete".into()),
+        }],
     };
     patched.apply_patch(patch);
 
@@ -1307,6 +1391,8 @@ fn patched_vindex_bake_down() {
                 layer: 0,
                 feature: 0,
                 gate_vector_b64: None,
+                up_vector_b64: None,
+                down_vector_b64: None,
                 down_meta: Some(larql_vindex::patch::core::PatchDownMeta {
                     top_token: "London".into(),
                     top_token_id: 300,
@@ -1352,15 +1438,18 @@ fn patched_vindex_remove_patch() {
         description: None,
         author: None,
         tags: vec![],
-        operations: vec![
-            larql_vindex::PatchOp::Update {
-                layer: 0, feature: 0,
-                gate_vector_b64: None,
-                down_meta: Some(larql_vindex::patch::core::PatchDownMeta {
-                    top_token: "London".into(), top_token_id: 300, c_score: 0.99,
-                }),
-            },
-        ],
+        operations: vec![larql_vindex::PatchOp::Update {
+            layer: 0,
+            feature: 0,
+            gate_vector_b64: None,
+            up_vector_b64: None,
+            down_vector_b64: None,
+            down_meta: Some(larql_vindex::patch::core::PatchDownMeta {
+                top_token: "London".into(),
+                top_token_id: 300,
+                c_score: 0.99,
+            }),
+        }],
     };
     patched.apply_patch(patch);
     assert_eq!(patched.feature_meta(0, 0).unwrap().top_token, "London");
@@ -1396,11 +1485,14 @@ fn weight_manifest_round_trip() {
         embed_scale: 1.0,
         extract_level: larql_vindex::ExtractLevel::Browse,
         dtype: larql_vindex::StorageDtype::F32,
+        quant: larql_vindex::QuantFormat::None,
         layer_bands: None,
         layers: vec![],
         down_top_k: 1,
         has_model_weights: false,
         model_config: None,
+        fp4: None,
+        ffn_layout: None,
     };
     VectorIndex::save_config(&config, &dir).unwrap();
 
@@ -1434,11 +1526,14 @@ fn dtype_config_f16_round_trip() {
         embed_scale: 1.0,
         extract_level: larql_vindex::ExtractLevel::Browse,
         dtype: larql_vindex::StorageDtype::F16,
+        quant: larql_vindex::QuantFormat::None,
         layer_bands: None,
         layers: vec![],
         down_top_k: 10,
         has_model_weights: false,
         model_config: None,
+        fp4: None,
+        ffn_layout: None,
     };
 
     VectorIndex::save_config(&config, &dir).unwrap();
@@ -1464,8 +1559,14 @@ fn dtype_serde_round_trip() {
 
 #[test]
 fn dtype_bytes_per_float() {
-    assert_eq!(larql_vindex::config::dtype::bytes_per_float(larql_vindex::StorageDtype::F32), 4);
-    assert_eq!(larql_vindex::config::dtype::bytes_per_float(larql_vindex::StorageDtype::F16), 2);
+    assert_eq!(
+        larql_vindex::config::dtype::bytes_per_float(larql_vindex::StorageDtype::F32),
+        4
+    );
+    assert_eq!(
+        larql_vindex::config::dtype::bytes_per_float(larql_vindex::StorageDtype::F16),
+        2
+    );
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -1515,12 +1616,23 @@ fn patch_multiple_patches_stack() {
 
     // Patch 1: update F0
     let p1 = larql_vindex::VindexPatch {
-        version: 1, base_model: "test".into(), base_checksum: None,
-        created_at: String::new(), description: None, author: None, tags: vec![],
+        version: 1,
+        base_model: "test".into(),
+        base_checksum: None,
+        created_at: String::new(),
+        description: None,
+        author: None,
+        tags: vec![],
         operations: vec![larql_vindex::PatchOp::Update {
-            layer: 0, feature: 0, gate_vector_b64: None,
+            layer: 0,
+            feature: 0,
+            gate_vector_b64: None,
+            up_vector_b64: None,
+            down_vector_b64: None,
             down_meta: Some(larql_vindex::patch::core::PatchDownMeta {
-                top_token: "London".into(), top_token_id: 300, c_score: 0.99,
+                top_token: "London".into(),
+                top_token_id: 300,
+                c_score: 0.99,
             }),
         }],
     };
@@ -1528,12 +1640,23 @@ fn patch_multiple_patches_stack() {
 
     // Patch 2: update F1
     let p2 = larql_vindex::VindexPatch {
-        version: 1, base_model: "test".into(), base_checksum: None,
-        created_at: String::new(), description: None, author: None, tags: vec![],
+        version: 1,
+        base_model: "test".into(),
+        base_checksum: None,
+        created_at: String::new(),
+        description: None,
+        author: None,
+        tags: vec![],
         operations: vec![larql_vindex::PatchOp::Update {
-            layer: 0, feature: 1, gate_vector_b64: None,
+            layer: 0,
+            feature: 1,
+            gate_vector_b64: None,
+            up_vector_b64: None,
+            down_vector_b64: None,
             down_meta: Some(larql_vindex::patch::core::PatchDownMeta {
-                top_token: "Munich".into(), top_token_id: 301, c_score: 0.95,
+                top_token: "Munich".into(),
+                top_token_id: 301,
+                c_score: 0.95,
             }),
         }],
     };
@@ -1552,22 +1675,44 @@ fn patched_vindex_later_patch_overrides_earlier() {
 
     // Both patches modify F0
     let p1 = larql_vindex::VindexPatch {
-        version: 1, base_model: "test".into(), base_checksum: None,
-        created_at: String::new(), description: None, author: None, tags: vec![],
+        version: 1,
+        base_model: "test".into(),
+        base_checksum: None,
+        created_at: String::new(),
+        description: None,
+        author: None,
+        tags: vec![],
         operations: vec![larql_vindex::PatchOp::Update {
-            layer: 0, feature: 0, gate_vector_b64: None,
+            layer: 0,
+            feature: 0,
+            gate_vector_b64: None,
+            up_vector_b64: None,
+            down_vector_b64: None,
             down_meta: Some(larql_vindex::patch::core::PatchDownMeta {
-                top_token: "London".into(), top_token_id: 300, c_score: 0.99,
+                top_token: "London".into(),
+                top_token_id: 300,
+                c_score: 0.99,
             }),
         }],
     };
     let p2 = larql_vindex::VindexPatch {
-        version: 1, base_model: "test".into(), base_checksum: None,
-        created_at: String::new(), description: None, author: None, tags: vec![],
+        version: 1,
+        base_model: "test".into(),
+        base_checksum: None,
+        created_at: String::new(),
+        description: None,
+        author: None,
+        tags: vec![],
         operations: vec![larql_vindex::PatchOp::Update {
-            layer: 0, feature: 0, gate_vector_b64: None,
+            layer: 0,
+            feature: 0,
+            gate_vector_b64: None,
+            up_vector_b64: None,
+            down_vector_b64: None,
             down_meta: Some(larql_vindex::patch::core::PatchDownMeta {
-                top_token: "Tokyo".into(), top_token_id: 400, c_score: 0.88,
+                top_token: "Tokyo".into(),
+                top_token_id: 400,
+                c_score: 0.88,
             }),
         }],
     };
@@ -1590,7 +1735,7 @@ fn full_lifecycle_build_query_mutate_save_reload() {
     g0[[0, 0]] = 10.0; // Paris
     g0[[1, 1]] = 10.0; // Berlin
     g0[[2, 2]] = 10.0; // Tokyo
-    // F3 is empty (free slot)
+                       // F3 is empty (free slot)
     let gate_vectors = vec![Some(g0)];
 
     let meta = vec![
@@ -1625,18 +1770,29 @@ fn full_lifecycle_build_query_mutate_save_reload() {
         version: 2,
         model: "lifecycle-test".into(),
         family: "test".into(),
-        source: None, checksums: None,
-        num_layers: 1, hidden_size: hidden, intermediate_size: 4, vocab_size: 200,
+        source: None,
+        checksums: None,
+        num_layers: 1,
+        hidden_size: hidden,
+        intermediate_size: 4,
+        vocab_size: 200,
         embed_scale: 1.0,
         extract_level: larql_vindex::ExtractLevel::Browse,
         dtype: larql_vindex::StorageDtype::F32,
-        layer_bands: None, layers: layer_infos, down_top_k: 1,
-        has_model_weights: false, model_config: None,
+        quant: larql_vindex::QuantFormat::None,
+        layer_bands: None,
+        layers: layer_infos,
+        down_top_k: 1,
+        has_model_weights: false,
+        model_config: None,
+        fp4: None,
+        ffn_layout: None,
     };
     VectorIndex::save_config(&config, &dir).unwrap();
 
     // Write tokenizer for binary down_meta loading
-    let tok_json = r#"{"version":"1.0","model":{"type":"BPE","vocab":{},"merges":[]},"added_tokens":[]}"#;
+    let tok_json =
+        r#"{"version":"1.0","model":{"type":"BPE","vocab":{},"merges":[]},"added_tokens":[]}"#;
     std::fs::write(dir.join("tokenizer.json"), tok_json).unwrap();
 
     // Reload
@@ -1675,29 +1831,55 @@ fn make_synthetic_model() -> larql_models::ModelWeights {
     for layer in 0..num_layers {
         // FFN gate (intermediate × hidden)
         let mut gate = ndarray::Array2::<f32>::zeros((intermediate, hidden));
-        for i in 0..intermediate { gate[[i, i % hidden]] = 1.0 + layer as f32; }
-        tensors.insert(format!("layers.{layer}.mlp.gate_proj.weight"), gate.into_shared());
+        for i in 0..intermediate {
+            gate[[i, i % hidden]] = 1.0 + layer as f32;
+        }
+        tensors.insert(
+            format!("layers.{layer}.mlp.gate_proj.weight"),
+            gate.into_shared(),
+        );
 
         // FFN up (intermediate × hidden)
         let mut up = ndarray::Array2::<f32>::zeros((intermediate, hidden));
-        for i in 0..intermediate { up[[i, (i + 1) % hidden]] = 0.5; }
-        tensors.insert(format!("layers.{layer}.mlp.up_proj.weight"), up.into_shared());
+        for i in 0..intermediate {
+            up[[i, (i + 1) % hidden]] = 0.5;
+        }
+        tensors.insert(
+            format!("layers.{layer}.mlp.up_proj.weight"),
+            up.into_shared(),
+        );
 
         // FFN down (hidden × intermediate)
         let mut down = ndarray::Array2::<f32>::zeros((hidden, intermediate));
-        for i in 0..intermediate { down[[i % hidden, i]] = 0.3; }
-        tensors.insert(format!("layers.{layer}.mlp.down_proj.weight"), down.into_shared());
+        for i in 0..intermediate {
+            down[[i % hidden, i]] = 0.3;
+        }
+        tensors.insert(
+            format!("layers.{layer}.mlp.down_proj.weight"),
+            down.into_shared(),
+        );
 
         // Attention Q/K/V/O (hidden × hidden)
         for suffix in &["q_proj", "k_proj", "v_proj", "o_proj"] {
             let mut attn = ndarray::Array2::<f32>::zeros((hidden, hidden));
-            for i in 0..hidden { attn[[i, i]] = 1.0; }
-            tensors.insert(format!("layers.{layer}.self_attn.{suffix}.weight"), attn.into_shared());
+            for i in 0..hidden {
+                attn[[i, i]] = 1.0;
+            }
+            tensors.insert(
+                format!("layers.{layer}.self_attn.{suffix}.weight"),
+                attn.into_shared(),
+            );
         }
 
         // Norms
-        vectors.insert(format!("layers.{layer}.input_layernorm.weight"), vec![1.0; hidden]);
-        vectors.insert(format!("layers.{layer}.post_attention_layernorm.weight"), vec![1.0; hidden]);
+        vectors.insert(
+            format!("layers.{layer}.input_layernorm.weight"),
+            vec![1.0; hidden],
+        );
+        vectors.insert(
+            format!("layers.{layer}.post_attention_layernorm.weight"),
+            vec![1.0; hidden],
+        );
     }
 
     // Final norm
@@ -1727,6 +1909,10 @@ fn make_synthetic_model() -> larql_models::ModelWeights {
     larql_models::ModelWeights {
         tensors,
         vectors,
+        raw_bytes: std::collections::HashMap::new(),
+        skipped_tensors: Vec::new(),
+        packed_mmaps: std::collections::HashMap::new(),
+        packed_byte_ranges: std::collections::HashMap::new(),
         embed,
         lm_head,
         num_layers,
@@ -1750,7 +1936,8 @@ fn extract_synthetic_model_f32() {
     let weights = make_synthetic_model();
 
     // Write tokenizer (minimal — just needs to exist)
-    let tok_json = r#"{"version":"1.0","model":{"type":"BPE","vocab":{},"merges":[]},"added_tokens":[]}"#;
+    let tok_json =
+        r#"{"version":"1.0","model":{"type":"BPE","vocab":{},"merges":[]},"added_tokens":[]}"#;
     std::fs::write(dir.join("tokenizer.json"), tok_json).unwrap();
 
     // Build with extract level All
@@ -1764,25 +1951,32 @@ fn extract_synthetic_model_f32() {
         larql_vindex::ExtractLevel::All,
         larql_vindex::StorageDtype::F32,
         &mut cb,
-    ).unwrap();
+    )
+    .unwrap();
 
     // Verify files exist
     assert!(dir.join("gate_vectors.bin").exists());
     assert!(dir.join("embeddings.bin").exists());
     assert!(dir.join("down_meta.bin").exists());
-    assert!(dir.join("down_meta.bin").exists(), "binary down_meta should be written during extract");
+    assert!(
+        dir.join("down_meta.bin").exists(),
+        "binary down_meta should be written during extract"
+    );
     assert!(dir.join("index.json").exists());
     assert!(dir.join("attn_weights.bin").exists());
     assert!(dir.join("up_weights.bin").exists());
     assert!(dir.join("down_weights.bin").exists());
     assert!(dir.join("norms.bin").exists());
-    assert!(dir.join("lm_head.bin").exists());
+    assert!(dir.join(LM_HEAD_BIN).exists());
     assert!(dir.join("weight_manifest.json").exists());
 
     // Binary down_meta should be non-empty (JSONL no longer written)
     let bin_size = std::fs::metadata(dir.join("down_meta.bin")).unwrap().len();
     assert!(bin_size > 0, "binary down_meta should be non-empty");
-    assert!(!dir.join("down_meta.jsonl").exists(), "JSONL should not be written during extract");
+    assert!(
+        !dir.join("down_meta.jsonl").exists(),
+        "JSONL should not be written during extract"
+    );
 
     // Verify config
     let config = larql_vindex::load_vindex_config(&dir).unwrap();
@@ -1817,7 +2011,8 @@ fn extract_synthetic_model_f16() {
     std::fs::create_dir_all(&dir).unwrap();
 
     let weights = make_synthetic_model();
-    let tok_json = r#"{"version":"1.0","model":{"type":"BPE","vocab":{},"merges":[]},"added_tokens":[]}"#;
+    let tok_json =
+        r#"{"version":"1.0","model":{"type":"BPE","vocab":{},"merges":[]},"added_tokens":[]}"#;
     std::fs::write(dir.join("tokenizer.json"), tok_json).unwrap();
 
     let mut cb = larql_vindex::SilentBuildCallbacks;
@@ -1830,14 +2025,20 @@ fn extract_synthetic_model_f16() {
         larql_vindex::ExtractLevel::Browse,
         larql_vindex::StorageDtype::F16,
         &mut cb,
-    ).unwrap();
+    )
+    .unwrap();
 
     // Verify both down_meta formats written
-    assert!(dir.join("down_meta.bin").exists(), "binary down_meta should be written during f16 extract");
+    assert!(
+        dir.join("down_meta.bin").exists(),
+        "binary down_meta should be written during f16 extract"
+    );
     assert!(dir.join("down_meta.bin").exists());
 
     // Verify f16 files are smaller
-    let gate_size = std::fs::metadata(dir.join("gate_vectors.bin")).unwrap().len();
+    let gate_size = std::fs::metadata(dir.join("gate_vectors.bin"))
+        .unwrap()
+        .len();
     // 2 layers × 4 features × 8 hidden × 2 bytes = 128 bytes (f16)
     // vs 256 bytes (f32)
     assert_eq!(gate_size, 128);
@@ -1870,7 +2071,8 @@ fn extract_then_load_weights_round_trip() {
     std::fs::create_dir_all(&dir).unwrap();
 
     let weights = make_synthetic_model();
-    let tok_json = r#"{"version":"1.0","model":{"type":"BPE","vocab":{},"merges":[]},"added_tokens":[]}"#;
+    let tok_json =
+        r#"{"version":"1.0","model":{"type":"BPE","vocab":{},"merges":[]},"added_tokens":[]}"#;
     std::fs::write(dir.join("tokenizer.json"), tok_json).unwrap();
 
     let mut cb = larql_vindex::SilentBuildCallbacks;
@@ -1883,7 +2085,8 @@ fn extract_then_load_weights_round_trip() {
         larql_vindex::ExtractLevel::All,
         larql_vindex::StorageDtype::F32,
         &mut cb,
-    ).unwrap();
+    )
+    .unwrap();
 
     // Load weights back
     let mut lcb = larql_vindex::SilentLoadCallbacks;
@@ -1923,7 +2126,8 @@ fn extract_mutate_reload_verifies_mutation() {
     std::fs::create_dir_all(&dir).unwrap();
 
     let weights = make_synthetic_model();
-    let tok_json = r#"{"version":"1.0","model":{"type":"BPE","vocab":{},"merges":[]},"added_tokens":[]}"#;
+    let tok_json =
+        r#"{"version":"1.0","model":{"type":"BPE","vocab":{},"merges":[]},"added_tokens":[]}"#;
     std::fs::write(dir.join("tokenizer.json"), tok_json).unwrap();
 
     let mut cb = larql_vindex::SilentBuildCallbacks;
@@ -1936,7 +2140,8 @@ fn extract_mutate_reload_verifies_mutation() {
         larql_vindex::ExtractLevel::Browse,
         larql_vindex::StorageDtype::F32,
         &mut cb,
-    ).unwrap();
+    )
+    .unwrap();
 
     // Load, mutate, save
     let mut lcb = larql_vindex::SilentLoadCallbacks;
@@ -1976,7 +2181,8 @@ fn extract_with_patches_bake_down() {
     std::fs::create_dir_all(&dir).unwrap();
 
     let weights = make_synthetic_model();
-    let tok_json = r#"{"version":"1.0","model":{"type":"BPE","vocab":{},"merges":[]},"added_tokens":[]}"#;
+    let tok_json =
+        r#"{"version":"1.0","model":{"type":"BPE","vocab":{},"merges":[]},"added_tokens":[]}"#;
     std::fs::write(dir.join("tokenizer.json"), tok_json).unwrap();
 
     let mut cb = larql_vindex::SilentBuildCallbacks;
@@ -1989,7 +2195,8 @@ fn extract_with_patches_bake_down() {
         larql_vindex::ExtractLevel::Browse,
         larql_vindex::StorageDtype::F32,
         &mut cb,
-    ).unwrap();
+    )
+    .unwrap();
 
     // Load base
     let mut lcb = larql_vindex::SilentLoadCallbacks;
@@ -2004,18 +2211,18 @@ fn extract_with_patches_bake_down() {
         description: Some("test patch".into()),
         author: None,
         tags: vec![],
-        operations: vec![
-            larql_vindex::PatchOp::Update {
-                layer: 0,
-                feature: 0,
-                gate_vector_b64: None,
-                down_meta: Some(larql_vindex::patch::core::PatchDownMeta {
-                    top_token: "PATCHED".into(),
-                    top_token_id: 888,
-                    c_score: 5.0,
-                }),
-            },
-        ],
+        operations: vec![larql_vindex::PatchOp::Update {
+            layer: 0,
+            feature: 0,
+            gate_vector_b64: None,
+            up_vector_b64: None,
+            down_vector_b64: None,
+            down_meta: Some(larql_vindex::patch::core::PatchDownMeta {
+                top_token: "PATCHED".into(),
+                top_token_id: 888,
+                c_score: 5.0,
+            }),
+        }],
     };
 
     let mut patched = larql_vindex::PatchedVindex::new(base);
@@ -2057,7 +2264,10 @@ fn gguf_config_from_metadata() {
     let gguf = GgufFile {
         metadata: {
             let mut m = std::collections::HashMap::new();
-            m.insert("general.architecture".into(), GgufValue::String("llama".into()));
+            m.insert(
+                "general.architecture".into(),
+                GgufValue::String("llama".into()),
+            );
             m.insert("llama.embedding_length".into(), GgufValue::U32(4096));
             m.insert("llama.block_count".into(), GgufValue::U32(32));
             m.insert("llama.feed_forward_length".into(), GgufValue::U32(11008));
@@ -2087,7 +2297,12 @@ fn patched_vindex_insert_feature() {
     let index = test_index();
     let mut patched = larql_vindex::PatchedVindex::new(index);
 
-    patched.insert_feature(0, 2, vec![0.0, 0.0, 0.0, 1.0], make_meta("Canberra", 99, 0.8));
+    patched.insert_feature(
+        0,
+        2,
+        vec![0.0, 0.0, 0.0, 1.0],
+        make_meta("Canberra", 99, 0.8),
+    );
     assert_eq!(patched.feature_meta(0, 2).unwrap().top_token, "Canberra");
     assert_eq!(patched.num_overrides(), 1);
     // Base unchanged
@@ -2110,7 +2325,12 @@ fn patched_vindex_gate_knn_includes_inserts() {
     let index = test_index();
     let mut patched = larql_vindex::PatchedVindex::new(index);
 
-    patched.insert_feature(0, 2, vec![0.0, 0.0, 0.0, 100.0], make_meta("Inserted", 55, 5.0));
+    patched.insert_feature(
+        0,
+        2,
+        vec![0.0, 0.0, 0.0, 100.0],
+        make_meta("Inserted", 55, 5.0),
+    );
     let query = Array1::from_vec(vec![0.0, 0.0, 0.0, 1.0]);
     let hits = patched.gate_knn(0, &query, 5);
     assert!(!hits.is_empty());
@@ -2153,7 +2373,8 @@ fn vindexfile_parse_and_build() {
     std::fs::create_dir_all(&base_dir).unwrap();
 
     // Save a base vindex (with tokenizer for binary down_meta loading)
-    let tok_json = r#"{"version":"1.0","model":{"type":"BPE","vocab":{},"merges":[]},"added_tokens":[]}"#;
+    let tok_json =
+        r#"{"version":"1.0","model":{"type":"BPE","vocab":{},"merges":[]},"added_tokens":[]}"#;
     std::fs::write(base_dir.join("tokenizer.json"), tok_json).unwrap();
 
     let index = test_index();
@@ -2162,6 +2383,7 @@ fn vindexfile_parse_and_build() {
         model: "test/vindexfile".into(),
         family: "llama".into(),
         dtype: larql_vindex::StorageDtype::F32,
+        quant: larql_vindex::QuantFormat::None,
         source: None,
         checksums: None,
         num_layers: 2,
@@ -2175,6 +2397,8 @@ fn vindexfile_parse_and_build() {
         layers: vec![],
         down_top_k: 5,
         model_config: None,
+        fp4: None,
+        ffn_layout: None,
     };
     index.save_vindex(&base_dir, &mut config).unwrap();
 
@@ -2191,23 +2415,28 @@ fn vindexfile_parse_and_build() {
         description: Some("test".into()),
         author: None,
         tags: vec![],
-        operations: vec![
-            larql_vindex::PatchOp::Update {
-                layer: 0, feature: 0,
-                gate_vector_b64: None,
-                down_meta: Some(larql_vindex::patch::core::PatchDownMeta {
-                    top_token: "PATCHED".into(),
-                    top_token_id: 999,
-                    c_score: 9.0,
-                }),
-            },
-        ],
+        operations: vec![larql_vindex::PatchOp::Update {
+            layer: 0,
+            feature: 0,
+            gate_vector_b64: None,
+            up_vector_b64: None,
+            down_vector_b64: None,
+            down_meta: Some(larql_vindex::patch::core::PatchDownMeta {
+                top_token: "PATCHED".into(),
+                top_token_id: 999,
+                c_score: 9.0,
+            }),
+        }],
     };
     let patch_path = patch_dir.join("test.vlp");
     patch.save(&patch_path).unwrap();
 
     // Build from Vindexfile
-    let vf_content = format!("FROM {}\nPATCH {}\n", base_dir.display(), patch_path.display());
+    let vf_content = format!(
+        "FROM {}\nPATCH {}\n",
+        base_dir.display(),
+        patch_path.display()
+    );
     let vf = larql_vindex::vindexfile::parse_vindexfile_str(&vf_content).unwrap();
     let result = larql_vindex::build_from_vindexfile(&vf, None, &std::env::temp_dir()).unwrap();
 
@@ -2228,7 +2457,9 @@ fn vindexfile_parse_and_build() {
 
 #[test]
 fn hf_path_detection() {
-    assert!(larql_vindex::is_hf_path("hf://chrishayuk/gemma-3-4b-it-vindex"));
+    assert!(larql_vindex::is_hf_path(
+        "hf://chrishayuk/gemma-3-4b-it-vindex"
+    ));
     assert!(larql_vindex::is_hf_path("hf://user/repo@v2.0"));
     assert!(!larql_vindex::is_hf_path("./local.vindex"));
     assert!(!larql_vindex::is_hf_path("/absolute/path"));
@@ -2277,7 +2508,11 @@ fn streaming_extract_from_safetensors() {
         "rope_theta": 10000.0,
         "vocab_size": 16,
     });
-    std::fs::write(model_dir.join("config.json"), serde_json::to_string(&config).unwrap()).unwrap();
+    std::fs::write(
+        model_dir.join("config.json"),
+        serde_json::to_string(&config).unwrap(),
+    )
+    .unwrap();
 
     // Write a minimal safetensors file with gate + down + embed tensors
     let mut tensors: std::collections::HashMap<String, Vec<f32>> = std::collections::HashMap::new();
@@ -2292,33 +2527,44 @@ fn streaming_extract_from_safetensors() {
     for layer in 0..2 {
         let gate: Vec<f32> = (0..32).map(|i| (i as f32 + layer as f32) * 0.1).collect();
         tensors.insert(format!("model.layers.{layer}.mlp.gate_proj.weight"), gate);
-        metadata.push((format!("model.layers.{layer}.mlp.gate_proj.weight"), vec![4, 8]));
+        metadata.push((
+            format!("model.layers.{layer}.mlp.gate_proj.weight"),
+            vec![4, 8],
+        ));
 
         let down: Vec<f32> = (0..32).map(|i| (i as f32) * 0.05).collect();
         tensors.insert(format!("model.layers.{layer}.mlp.down_proj.weight"), down);
-        metadata.push((format!("model.layers.{layer}.mlp.down_proj.weight"), vec![8, 4]));
+        metadata.push((
+            format!("model.layers.{layer}.mlp.down_proj.weight"),
+            vec![8, 4],
+        ));
     }
 
     // Build safetensors file
-    let tensor_bytes: Vec<(String, Vec<u8>, Vec<usize>)> = metadata.iter()
+    let tensor_bytes: Vec<(String, Vec<u8>, Vec<usize>)> = metadata
+        .iter()
         .map(|(name, shape)| {
             let data = &tensors[name];
             let bytes: Vec<u8> = data.iter().flat_map(|f| f.to_le_bytes()).collect();
             (name.clone(), bytes, shape.clone())
         })
         .collect();
-    let views: Vec<(String, safetensors::tensor::TensorView<'_>)> = tensor_bytes.iter()
+    let views: Vec<(String, safetensors::tensor::TensorView<'_>)> = tensor_bytes
+        .iter()
         .map(|(name, bytes, shape)| {
-            (name.clone(), safetensors::tensor::TensorView::new(
-                safetensors::Dtype::F32, shape.clone(), bytes,
-            ).unwrap())
+            (
+                name.clone(),
+                safetensors::tensor::TensorView::new(safetensors::Dtype::F32, shape.clone(), bytes)
+                    .unwrap(),
+            )
         })
         .collect();
     let serialized = safetensors::tensor::serialize(views, &None).unwrap();
     std::fs::write(model_dir.join("model.safetensors"), &serialized).unwrap();
 
     // Write tokenizer
-    let tok_json = r#"{"version":"1.0","model":{"type":"BPE","vocab":{},"merges":[]},"added_tokens":[]}"#;
+    let tok_json =
+        r#"{"version":"1.0","model":{"type":"BPE","vocab":{},"merges":[]},"added_tokens":[]}"#;
     std::fs::write(model_dir.join("tokenizer.json"), tok_json).unwrap();
 
     // Run streaming extraction
@@ -2333,8 +2579,13 @@ fn streaming_extract_from_safetensors() {
         5,
         larql_vindex::ExtractLevel::Browse,
         larql_vindex::StorageDtype::F32,
+        larql_vindex::QuantFormat::None,
+        larql_vindex::WriteWeightsOptions::default(),
+        larql_vindex::Q4kWriteOptions::default(),
+        false,
         &mut cb,
-    ).unwrap();
+    )
+    .unwrap();
 
     // Verify output
     assert!(output_dir.join("gate_vectors.bin").exists());
@@ -2359,6 +2610,408 @@ fn streaming_extract_from_safetensors() {
 
     let _ = std::fs::remove_dir_all(&model_dir);
     let _ = std::fs::remove_dir_all(&output_dir);
+}
+
+// ─── streaming_extract with QuantFormat::Q4K ────────────────────
+//
+// End-to-end coverage for `write_model_weights_q4k`:
+//   - Manifest shape: attn has 4 entries per layer, FFN has 3;
+//     V and down carry Q6_K, everything else Q4_K.
+//   - Offsets tile start-to-end with no gaps.
+//   - `config.quant = Q4K` and `has_model_weights = true` land in
+//     `index.json` so loaders can dispatch without sniffing files.
+//   - The non-Q4 `attn_weights.bin` / `interleaved.bin` are absent.
+#[test]
+fn streaming_extract_q4k_from_safetensors() {
+    use larql_vindex::QuantFormat;
+    use std::collections::HashMap;
+
+    let model_dir = std::env::temp_dir().join("larql_test_streaming_q4k_model");
+    let output_dir = std::env::temp_dir().join("larql_test_streaming_q4k_output");
+    let _ = std::fs::remove_dir_all(&model_dir);
+    let _ = std::fs::remove_dir_all(&output_dir);
+    std::fs::create_dir_all(&model_dir).unwrap();
+
+    // Small llama config — dims chosen so each tensor pads to exactly
+    // one 256-element Q4_K/Q6_K super-block (256 elems = 2×128 or 8×32
+    // or 16×16). Hidden=8 keeps padding overhead visible; the padder
+    // zero-fills to the next 256-multiple.
+    let hidden = 8usize;
+    let intermediate = 4usize;
+    let num_layers = 2usize;
+    let vocab = 16usize;
+
+    let config = serde_json::json!({
+        "model_type": "llama",
+        "hidden_size": hidden,
+        "num_hidden_layers": num_layers,
+        "intermediate_size": intermediate,
+        "num_attention_heads": 1,
+        "num_key_value_heads": 1,
+        "head_dim": hidden,
+        "rope_theta": 10000.0,
+        "vocab_size": vocab,
+    });
+    std::fs::write(
+        model_dir.join("config.json"),
+        serde_json::to_string(&config).unwrap(),
+    )
+    .unwrap();
+
+    let mut tensors: HashMap<String, Vec<f32>> = HashMap::new();
+    let mut metadata: Vec<(String, Vec<usize>)> = Vec::new();
+
+    let push = |tensors: &mut HashMap<String, Vec<f32>>,
+                metadata: &mut Vec<(String, Vec<usize>)>,
+                name: &str,
+                shape: Vec<usize>| {
+        let n: usize = shape.iter().product();
+        let data: Vec<f32> = (0..n).map(|i| (i as f32) * 0.01).collect();
+        tensors.insert(name.into(), data);
+        metadata.push((name.into(), shape));
+    };
+
+    push(
+        &mut tensors,
+        &mut metadata,
+        "model.embed_tokens.weight",
+        vec![vocab, hidden],
+    );
+    push(
+        &mut tensors,
+        &mut metadata,
+        "model.norm.weight",
+        vec![hidden],
+    );
+
+    for layer in 0..num_layers {
+        let lp = format!("model.layers.{layer}");
+        // Attention: Q/K/V/O all [hidden, hidden]
+        push(
+            &mut tensors,
+            &mut metadata,
+            &format!("{lp}.self_attn.q_proj.weight"),
+            vec![hidden, hidden],
+        );
+        push(
+            &mut tensors,
+            &mut metadata,
+            &format!("{lp}.self_attn.k_proj.weight"),
+            vec![hidden, hidden],
+        );
+        push(
+            &mut tensors,
+            &mut metadata,
+            &format!("{lp}.self_attn.v_proj.weight"),
+            vec![hidden, hidden],
+        );
+        push(
+            &mut tensors,
+            &mut metadata,
+            &format!("{lp}.self_attn.o_proj.weight"),
+            vec![hidden, hidden],
+        );
+        // FFN: gate [inter, hidden], up [inter, hidden], down [hidden, inter]
+        push(
+            &mut tensors,
+            &mut metadata,
+            &format!("{lp}.mlp.gate_proj.weight"),
+            vec![intermediate, hidden],
+        );
+        push(
+            &mut tensors,
+            &mut metadata,
+            &format!("{lp}.mlp.up_proj.weight"),
+            vec![intermediate, hidden],
+        );
+        push(
+            &mut tensors,
+            &mut metadata,
+            &format!("{lp}.mlp.down_proj.weight"),
+            vec![hidden, intermediate],
+        );
+        // Norms
+        push(
+            &mut tensors,
+            &mut metadata,
+            &format!("{lp}.input_layernorm.weight"),
+            vec![hidden],
+        );
+        push(
+            &mut tensors,
+            &mut metadata,
+            &format!("{lp}.post_attention_layernorm.weight"),
+            vec![hidden],
+        );
+    }
+
+    let tensor_bytes: Vec<(String, Vec<u8>, Vec<usize>)> = metadata
+        .iter()
+        .map(|(name, shape)| {
+            let data = &tensors[name];
+            let bytes: Vec<u8> = data.iter().flat_map(|f| f.to_le_bytes()).collect();
+            (name.clone(), bytes, shape.clone())
+        })
+        .collect();
+    let views: Vec<(String, safetensors::tensor::TensorView<'_>)> = tensor_bytes
+        .iter()
+        .map(|(name, bytes, shape)| {
+            (
+                name.clone(),
+                safetensors::tensor::TensorView::new(safetensors::Dtype::F32, shape.clone(), bytes)
+                    .unwrap(),
+            )
+        })
+        .collect();
+    let serialized = safetensors::tensor::serialize(views, &None).unwrap();
+    std::fs::write(model_dir.join("model.safetensors"), &serialized).unwrap();
+
+    let tok_json =
+        r#"{"version":"1.0","model":{"type":"BPE","vocab":{},"merges":[]},"added_tokens":[]}"#;
+    std::fs::write(model_dir.join("tokenizer.json"), tok_json).unwrap();
+    let tokenizer = larql_vindex::tokenizers::Tokenizer::from_bytes(tok_json.as_bytes()).unwrap();
+
+    // Run with QuantFormat::Q4K — also verifies the Browse-level auto-
+    // promotion to "all" that the streaming extractor applies when
+    // quant != None.
+    let mut cb = larql_vindex::SilentBuildCallbacks;
+    larql_vindex::build_vindex_streaming(
+        &model_dir,
+        &tokenizer,
+        "test/streaming-q4k",
+        &output_dir,
+        5,
+        larql_vindex::ExtractLevel::Browse,
+        larql_vindex::StorageDtype::F32,
+        QuantFormat::Q4K,
+        larql_vindex::WriteWeightsOptions::default(),
+        larql_vindex::Q4kWriteOptions::default(),
+        false,
+        &mut cb,
+    )
+    .unwrap();
+
+    // ── File layout ──
+    assert!(output_dir.join("attn_weights_q4k.bin").exists());
+    assert!(output_dir.join("attn_weights_q4k_manifest.json").exists());
+    assert!(output_dir.join("interleaved_q4k.bin").exists());
+    assert!(output_dir.join("interleaved_q4k_manifest.json").exists());
+    assert!(output_dir.join("norms.bin").exists());
+    assert!(output_dir.join("weight_manifest.json").exists());
+    assert!(output_dir.join("index.json").exists());
+
+    // Q4K path writes its own filenames; the non-Q4 names should be absent.
+    assert!(
+        !output_dir.join("attn_weights.bin").exists(),
+        "Q4 path should not emit attn_weights.bin"
+    );
+
+    // ── Config schema ──
+    let cfg = larql_vindex::load_vindex_config(&output_dir).unwrap();
+    assert_eq!(cfg.num_layers, num_layers);
+    assert_eq!(cfg.quant, QuantFormat::Q4K, "config.quant must be Q4K");
+    assert!(
+        cfg.has_model_weights,
+        "config.has_model_weights must flip true"
+    );
+
+    // ── attn manifest ──
+    let attn_manifest_json =
+        std::fs::read_to_string(output_dir.join("attn_weights_q4k_manifest.json")).unwrap();
+    let attn_entries: Vec<serde_json::Value> = serde_json::from_str(&attn_manifest_json).unwrap();
+
+    // 4 tensors (Q, K, V, O) × num_layers
+    assert_eq!(
+        attn_entries.len(),
+        num_layers * 4,
+        "attn manifest should have 4N entries (Q/K/V/O per layer)"
+    );
+
+    // Per-layer slot order: Q=Q4_K, K=Q4_K, V=Q6_K, O=Q4_K.
+    // Offsets must chain start-to-end with no gaps.
+    let mut expected_offset: u64 = 0;
+    for (i, entry) in attn_entries.iter().enumerate() {
+        let slot = i % 4;
+        let format = entry["format"].as_str().unwrap();
+        let expected_format = if slot == 2 { "Q6_K" } else { "Q4_K" };
+        assert_eq!(
+            format, expected_format,
+            "entry {i} slot {slot}: expected {expected_format}, got {format}"
+        );
+        let offset = entry["offset"].as_u64().unwrap();
+        assert_eq!(offset, expected_offset, "offsets must tile with no gaps");
+        let length = entry["length"].as_u64().unwrap();
+        assert!(length > 0, "each entry must carry bytes");
+        expected_offset += length;
+    }
+
+    // ── interleaved (FFN) manifest ──
+    let ff_manifest_json =
+        std::fs::read_to_string(output_dir.join("interleaved_q4k_manifest.json")).unwrap();
+    let ff_entries: Vec<serde_json::Value> = serde_json::from_str(&ff_manifest_json).unwrap();
+
+    // 3 tensors (gate, up, down) × num_layers
+    assert_eq!(
+        ff_entries.len(),
+        num_layers * 3,
+        "FFN manifest should have 3N entries (gate/up/down per layer)"
+    );
+
+    // Per-layer slot order: gate=Q4_K, up=Q4_K, down=Q6_K.
+    let mut expected_offset: u64 = 0;
+    for (i, entry) in ff_entries.iter().enumerate() {
+        let slot = i % 3;
+        let format = entry["format"].as_str().unwrap();
+        let expected_format = if slot == 2 { "Q6_K" } else { "Q4_K" };
+        assert_eq!(
+            format, expected_format,
+            "FFN entry {i} slot {slot}: expected {expected_format}, got {format}"
+        );
+        let offset = entry["offset"].as_u64().unwrap();
+        assert_eq!(
+            offset, expected_offset,
+            "FFN offsets must tile with no gaps"
+        );
+        expected_offset += entry["length"].as_u64().unwrap();
+    }
+
+    // ── manifest byte counts match file sizes ──
+    let attn_bytes = std::fs::metadata(output_dir.join("attn_weights_q4k.bin"))
+        .unwrap()
+        .len();
+    let attn_manifest_total: u64 = attn_entries
+        .iter()
+        .map(|e| e["length"].as_u64().unwrap())
+        .sum();
+    assert_eq!(
+        attn_bytes, attn_manifest_total,
+        "attn_weights_q4k.bin size must equal sum of manifest lengths"
+    );
+
+    let ff_bytes = std::fs::metadata(output_dir.join("interleaved_q4k.bin"))
+        .unwrap()
+        .len();
+    let ff_manifest_total: u64 = ff_entries
+        .iter()
+        .map(|e| e["length"].as_u64().unwrap())
+        .sum();
+    assert_eq!(
+        ff_bytes, ff_manifest_total,
+        "interleaved_q4k.bin size must equal sum of manifest lengths"
+    );
+
+    // ── load_model_weights on a Q4K vindex must surface a clear error ──
+    // The float-weight loader can't reconstruct a ModelWeights struct
+    // from Q4_K/Q6_K blocks; callers must go through
+    // `VectorIndex::load_attn_q4k` / `load_interleaved_q4k` instead.
+    let mut lcb = larql_vindex::SilentLoadCallbacks;
+    match larql_vindex::load_model_weights(&output_dir, &mut lcb) {
+        Ok(_) => panic!("load_model_weights on a Q4K vindex must error"),
+        Err(e) => {
+            let msg = e.to_string();
+            assert!(
+                msg.contains("quantised") && msg.contains("load_attn_q4k"),
+                "expected quant-dispatch error, got: {msg}"
+            );
+        }
+    }
+
+    // ── VectorIndex::load_attn_q4k + load_interleaved_q4k must read
+    //     back what the writer emitted ──
+    let mut index = larql_vindex::VectorIndex::load_vindex(&output_dir, &mut lcb).unwrap();
+    index.load_attn_q4k(&output_dir).unwrap();
+    index.load_interleaved_q4k(&output_dir).unwrap();
+    assert!(
+        index.has_interleaved_q4k(),
+        "interleaved Q4K should be loaded"
+    );
+    // Layer 0 attn slices: [Q/Q4_K, K/Q4_K, V/Q6_K, O/Q4_K]
+    let slices = index.attn_q4k_layer_data(0).expect("layer 0 attn data");
+    assert_eq!(slices[0].1, "Q4_K", "Q slot format");
+    assert_eq!(slices[1].1, "Q4_K", "K slot format");
+    assert_eq!(slices[2].1, "Q6_K", "V slot format");
+    assert_eq!(slices[3].1, "Q4_K", "O slot format");
+
+    // ── Write-side correctness: dequantize the bytes the writer emitted
+    //     and confirm they round-trip back to the source within block
+    //     error tolerance. Proves the writer's manifest → data
+    //     correspondence is correct (not just a shape assertion).
+    //
+    // Source data for every tensor: (0..n).map(|i| i as f32 * 0.01).
+    // Q/K/V/O are hidden×hidden = 64 elems each, zero-padded to 256.
+    //
+    // Block-level error on a 64-value-then-192-zero-padded 256-value
+    // super-block: ~0.02 for Q4_K and ~0.006 for Q6_K on this linear
+    // ramp. Use 0.03 / 0.01 as ceilings — loose enough for the
+    // quantiser's block allocation on this padding-heavy synthetic
+    // case, tight enough to catch a manifest that points at the wrong
+    // bytes (which would produce garbage orders of magnitude worse).
+    let expected: Vec<f32> = (0..(hidden * hidden)).map(|i| (i as f32) * 0.01).collect();
+
+    // The writer's `pad_rows_to_256` zero-extends each row from `hidden`
+    // to 256 cols before quantising, so the dequantised output is a
+    // [hidden × 256] padded matrix, not a flat copy of `expected`.
+    // Map (row, col) of the original to the padded layout for comparison.
+    let padded_cols = 256;
+    let padded_at = |row: usize, col: usize| -> usize { row * padded_cols + col };
+
+    let q_dequant =
+        larql_models::quant::ggml::dequantize_q4_k(slices[0].0, hidden * padded_cols).unwrap();
+    for row in 0..hidden {
+        for col in 0..hidden {
+            let i = row * hidden + col;
+            let v = expected[i];
+            let got = q_dequant[padded_at(row, col)];
+            assert!(
+                (got - v).abs() < 0.03,
+                "Q[r{row} c{col}] round-trip diverged: got {got}, expected {v}",
+            );
+        }
+        // Per-row zero pad: cols [hidden..256] should dequantise near zero
+        // (within block error — the row's value range sets the scale).
+        for col in hidden..padded_cols {
+            let got = q_dequant[padded_at(row, col)];
+            assert!(
+                got.abs() < 0.05,
+                "Q padding[r{row} c{col}] expected ~0, got {got}",
+            );
+        }
+    }
+
+    let v_dequant =
+        larql_models::quant::ggml::dequantize_q6_k(slices[2].0, hidden * padded_cols).unwrap();
+    for row in 0..hidden {
+        for col in 0..hidden {
+            let i = row * hidden + col;
+            let v = expected[i];
+            let got = v_dequant[padded_at(row, col)];
+            assert!(
+                (got - v).abs() < 0.01,
+                "V[r{row} c{col}] round-trip diverged (Q6_K): got {got}, expected {v}",
+            );
+        }
+    }
+
+    let _ = std::fs::remove_dir_all(&model_dir);
+    let _ = std::fs::remove_dir_all(&output_dir);
+}
+
+#[test]
+fn quant_block_format_serde_roundtrip() {
+    // The manifest format strings are load-bearing — llama.cpp / Ollama
+    // expect the literal "Q4_K" and "Q6_K" on the wire. The enum uses
+    // #[serde(rename)] to keep those strings; a future refactor must
+    // not drift to e.g. "Q4K" without also updating every reader.
+    use larql_vindex::format::weights::write_q4k::QuantBlockFormat;
+    let q4 = serde_json::to_string(&QuantBlockFormat::Q4K).unwrap();
+    let q6 = serde_json::to_string(&QuantBlockFormat::Q6K).unwrap();
+    assert_eq!(q4, "\"Q4_K\"");
+    assert_eq!(q6, "\"Q6_K\"");
+
+    let parsed: QuantBlockFormat = serde_json::from_str("\"Q4_K\"").unwrap();
+    assert_eq!(parsed, QuantBlockFormat::Q4K);
+    let parsed: QuantBlockFormat = serde_json::from_str("\"Q6_K\"").unwrap();
+    assert_eq!(parsed, QuantBlockFormat::Q6K);
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -2392,7 +3045,12 @@ fn gate_index_trait_on_patched_vindex() {
     let mut patched = larql_vindex::PatchedVindex::new(index);
 
     // Insert a strong feature that should dominate KNN
-    patched.insert_feature(0, 2, vec![0.0, 0.0, 0.0, 100.0], make_meta("Inserted", 55, 5.0));
+    patched.insert_feature(
+        0,
+        2,
+        vec![0.0, 0.0, 0.0, 100.0],
+        make_meta("Inserted", 55, 5.0),
+    );
     // Delete feature 0 (Paris)
     patched.delete_feature(0, 0);
 
@@ -2409,7 +3067,7 @@ fn gate_index_trait_on_patched_vindex() {
     let query = Array1::from_vec(vec![0.0, 0.0, 0.0, 1.0]);
     let hits = gi.gate_knn(0, &query, 5);
     assert_eq!(hits[0].0, 2); // inserted feature dominates
-    // gate_knn excludes the deleted feature
+                              // gate_knn excludes the deleted feature
     assert!(hits.iter().all(|(f, _)| *f != 0));
 }
 
@@ -2426,7 +3084,12 @@ fn gate_index_patched_walk_sees_mutations() {
     assert!(layer0_before.iter().any(|h| h.meta.top_token == "Paris"));
 
     // Insert a dominating feature
-    patched.insert_feature(0, 2, vec![100.0, 0.0, 0.0, 0.0], make_meta("NewCity", 77, 9.0));
+    patched.insert_feature(
+        0,
+        2,
+        vec![100.0, 0.0, 0.0, 0.0],
+        make_meta("NewCity", 77, 9.0),
+    );
     // Delete Paris
     patched.delete_feature(0, 0);
 
@@ -2471,7 +3134,12 @@ fn gate_walk_matches_gate_knn() {
     assert_eq!(knn.len(), walk.len());
     for (k, w) in knn.iter().zip(walk.iter()) {
         assert_eq!(k.0, w.0, "feature index mismatch");
-        assert!((k.1 - w.1).abs() < 1e-5, "score mismatch: {} vs {}", k.1, w.1);
+        assert!(
+            (k.1 - w.1).abs() < 1e-5,
+            "score mismatch: {} vs {}",
+            k.1,
+            w.1
+        );
     }
 }
 
@@ -2502,9 +3170,14 @@ fn gate_knn_q4_produces_results() {
 
     // Simulate Q4 scoring path (same logic as gate_knn_q4)
     let (q8_x, q8_scales) = larql_compute::cpu::q4::quantize_to_q8(query.as_slice().unwrap());
-    let scores = backend.q4_matvec(&q4_data, &q8_x, &q8_scales, features, hidden).unwrap();
+    let scores = backend
+        .q4_matvec(&q4_data, &q8_x, &q8_scales, features, hidden)
+        .unwrap();
     assert_eq!(scores.len(), features);
-    assert!(scores.iter().any(|&v| v.abs() > 0.01), "Q4 should produce nonzero scores");
+    assert!(
+        scores.iter().any(|&v| v.abs() > 0.01),
+        "Q4 should produce nonzero scores"
+    );
 
     // f32 KNN for comparison
     let f32_hits = idx.gate_knn(0, &query, 5);
@@ -2513,7 +3186,10 @@ fn gate_knn_q4_produces_results() {
     // Q4 top-1 should usually match f32 top-1 (same dominant feature)
     let mut q4_indexed: Vec<(usize, f32)> = scores.iter().copied().enumerate().collect();
     q4_indexed.sort_by(|a, b| b.1.abs().partial_cmp(&a.1.abs()).unwrap());
-    assert_eq!(q4_indexed[0].0, f32_hits[0].0, "Q4 top-1 should match f32 top-1");
+    assert_eq!(
+        q4_indexed[0].0, f32_hits[0].0,
+        "Q4 top-1 should match f32 top-1"
+    );
 }
 
 #[test]
@@ -2522,7 +3198,9 @@ fn gate_knn_q4_method_works() {
 
     let hidden = 256;
     let features = 64;
-    let gate_f32: Vec<f32> = (0..features * hidden).map(|i| (i as f32 * 0.001).cos()).collect();
+    let gate_f32: Vec<f32> = (0..features * hidden)
+        .map(|i| (i as f32 * 0.001).cos())
+        .collect();
     let q4_data = quantize_q4_0(&gate_f32);
     let gate_arr = Array2::from_shape_vec((features, hidden), gate_f32).unwrap();
 
@@ -2542,7 +3220,10 @@ fn gate_knn_q4_method_works() {
     let query = Array1::from_shape_fn(hidden, |i| (i as f32 * 0.01).sin());
     let hits = idx.gate_knn_q4(0, &query, 5, backend.as_ref()).unwrap();
     assert_eq!(hits.len(), 5);
-    assert!(hits[0].1.abs() > hits[4].1.abs(), "results should be sorted by abs score");
+    assert!(
+        hits[0].1.abs() > hits[4].1.abs(),
+        "results should be sorted by abs score"
+    );
 
     // Compare with f32 KNN
     let f32_hits = idx.gate_knn(0, &query, 5);
@@ -2557,7 +3238,9 @@ fn gate_q4_data_returns_correct_bytes() {
 
     let hidden = 256;
     let features = 32;
-    let gate_f32: Vec<f32> = (0..features * hidden).map(|i| (i as f32 * 0.001).cos()).collect();
+    let gate_f32: Vec<f32> = (0..features * hidden)
+        .map(|i| (i as f32 * 0.001).cos())
+        .collect();
     let q4_data = quantize_q4_0(&gate_f32);
     let gate_arr = Array2::from_shape_vec((features, hidden), gate_f32).unwrap();
 
@@ -2602,7 +3285,7 @@ fn lm_head_knn_returns_top_k() {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let lm_bytes: Vec<u8> = lm_head.iter().flat_map(|f| f.to_le_bytes()).collect();
-    std::fs::write(dir.join("lm_head.bin"), &lm_bytes).unwrap();
+    std::fs::write(dir.join(LM_HEAD_BIN), &lm_bytes).unwrap();
 
     let mut idx = VectorIndex::new(vec![None], vec![None], 1, hidden);
     idx.load_lm_head(&dir).unwrap();
@@ -2613,7 +3296,10 @@ fn lm_head_knn_returns_top_k() {
     let hits = idx.lm_head_knn(&query, 3);
     assert_eq!(hits.len(), 3);
     assert_eq!(hits[0].0, 0, "token 0 should be top-1 for dim 0 query");
-    assert!(hits[0].1 > hits[1].1, "results should be sorted by score desc");
+    assert!(
+        hits[0].1 > hits[1].1,
+        "results should be sorted by score desc"
+    );
 
     // Query aligned with dim 1 → token 3 should win
     let query = Array1::from_vec(vec![0.0, 1.0, 0.0, 0.0]);
@@ -2664,7 +3350,10 @@ fn hnsw_knn_produces_valid_results() {
     }
     // Results should be sorted by absolute score descending
     for w in hnsw.windows(2) {
-        assert!(w[0].1.abs() >= w[1].1.abs(), "results should be sorted by |score| desc");
+        assert!(
+            w[0].1.abs() >= w[1].1.abs(),
+            "results should be sorted by |score| desc"
+        );
     }
 }
 
@@ -2674,7 +3363,7 @@ fn hnsw_knn_produces_valid_results() {
 
 #[test]
 fn residency_pin_and_evict() {
-    use larql_vindex::{ResidencyManager, LayerState};
+    use larql_vindex::{LayerState, ResidencyManager};
 
     let mut rm = ResidencyManager::new(10, 4, 256, vec![32, 32, 32, 32]);
     assert_eq!(rm.num_pinned(), 0);
@@ -2716,12 +3405,12 @@ fn residency_budget_enforcement() {
     // We need a budget in MB that fits 1 layer but not 2.
     // 4608 * 2 = 9216 bytes. Create a manager and pin with exact byte checks.
     let _rm2 = ResidencyManager::new(1, 2, 256, vec![32, 32]); // 1 MB budget
-    // 1 MB >> 9216 bytes, so both will fit. Instead test with large layers.
-    // Use features=4096 so each layer is 4096*256/32*18 = 589,824 bytes = 0.56 MB
+                                                               // 1 MB >> 9216 bytes, so both will fit. Instead test with large layers.
+                                                               // Use features=4096 so each layer is 4096*256/32*18 = 589,824 bytes = 0.56 MB
     let big_features = 4096;
     let big_data = vec![0u8; big_features * 256 / 32 * 18]; // ~576 KB
     let mut rm3 = ResidencyManager::new(1, 3, 256, vec![big_features; 3]); // 1 MB budget
-    assert!(rm3.pin_layer(0, &big_data));  // ~576 KB, fits
+    assert!(rm3.pin_layer(0, &big_data)); // ~576 KB, fits
     assert!(!rm3.pin_layer(1, &big_data)); // ~1152 KB total, exceeds 1 MB
     assert_eq!(rm3.num_pinned(), 1);
 }
@@ -2742,8 +3431,12 @@ fn residency_auto_pin_fills_budget() {
     rm.mark_q4_available();
 
     // Record accesses — layers 2, 5 are hot
-    for _ in 0..100 { rm.record_access(2); }
-    for _ in 0..50 { rm.record_access(5); }
+    for _ in 0..100 {
+        rm.record_access(2);
+    }
+    for _ in 0..50 {
+        rm.record_access(5);
+    }
 
     let pinned = rm.auto_pin(|_| Some(vec![0u8; q4_per_layer]));
     assert_eq!(pinned, layers); // budget fits all
@@ -2790,12 +3483,14 @@ fn residency_summary() {
 
 #[test]
 fn adaptive_gate_knn_uses_pinned() {
-    use larql_vindex::ResidencyManager;
     use larql_compute::cpu::q4::quantize_q4_0;
+    use larql_vindex::ResidencyManager;
 
     let hidden = 256;
     let features = 64;
-    let gate_f32: Vec<f32> = (0..features * hidden).map(|i| (i as f32 * 0.001).cos()).collect();
+    let gate_f32: Vec<f32> = (0..features * hidden)
+        .map(|i| (i as f32 * 0.001).cos())
+        .collect();
     let q4_data = quantize_q4_0(&gate_f32);
     let gate_arr = Array2::from_shape_vec((features, hidden), gate_f32).unwrap();
 
@@ -2813,5 +3508,592 @@ fn adaptive_gate_knn_uses_pinned() {
 
     // Should match f32 brute-force top-1
     let f32_hits = idx.gate_knn(0, &query, 5);
-    assert_eq!(hits[0].0, f32_hits[0].0, "pinned Q4 top-1 should match f32 top-1");
+    assert_eq!(
+        hits[0].0, f32_hits[0].0,
+        "pinned Q4 top-1 should match f32 top-1"
+    );
+}
+
+// ─── PLE tensors survive Q4_K extract → load round-trip ─────────
+//
+// Regression test for the Gemma 4 E2B "predict returns garbage on
+// Q4K vindex" bug: the extractor used to drop the six Per-Layer
+// Embedding tensors, so `precompute_per_layer_inputs` silently
+// returned an empty Vec and PLE was never applied. Extraction now
+// writes `ple_weights.bin` (Q4_K-packed tensors) plus the two small
+// PLE norms into norms.bin. This test builds a Gemma 4-shaped
+// synthetic safetensors, runs the real extract pipeline, loads via
+// `load_model_weights_q4k`, and asserts every PLE tensor is back in
+// `weights.tensors` / `weights.vectors` with the right shape.
+#[test]
+fn streaming_extract_q4k_carries_ple_tensors() {
+    use larql_vindex::QuantFormat;
+    use std::collections::HashMap;
+
+    let model_dir = std::env::temp_dir().join("larql_test_streaming_q4k_ple_model");
+    let output_dir = std::env::temp_dir().join("larql_test_streaming_q4k_ple_output");
+    let _ = std::fs::remove_dir_all(&model_dir);
+    let _ = std::fs::remove_dir_all(&output_dir);
+    std::fs::create_dir_all(&model_dir).unwrap();
+
+    // E2B-shaped config at a test-friendly scale. `hidden_size_per_layer_input`
+    // is the knob `has_per_layer_embeddings()` keys off, so it must be present
+    // AND non-zero for the extractor to hit the PLE path. Gemma 4 uses the
+    // text_config wrapper; detect_from_json handles that.
+    let hidden = 256usize; // multiple of 256 so Q/K/V/O skip the padder
+    let intermediate = 256usize;
+    let num_layers = 2usize;
+    let vocab = 256usize;
+    let ple_dim = 256usize;
+
+    let config = serde_json::json!({
+        "model_type": "gemma4",
+        "text_config": {
+            "model_type": "gemma4_text",
+            "hidden_size": hidden,
+            "intermediate_size": intermediate,
+            "num_hidden_layers": num_layers,
+            "num_attention_heads": 1,
+            "num_key_value_heads": 1,
+            "head_dim": hidden,
+            "hidden_size_per_layer_input": ple_dim,
+            "vocab_size": vocab,
+            // Gemma 4 ships with a final-logit tanh softcap of 30.0. This
+            // must survive extract → load; without it predict_q4k peaks
+            // on the wrong token on E2B.
+            "final_logit_softcapping": 30.0,
+        }
+    });
+    std::fs::write(
+        model_dir.join("config.json"),
+        serde_json::to_string(&config).unwrap(),
+    )
+    .unwrap();
+
+    let mut tensors: HashMap<String, Vec<f32>> = HashMap::new();
+    let mut metadata: Vec<(String, Vec<usize>)> = Vec::new();
+
+    let push = |tensors: &mut HashMap<String, Vec<f32>>,
+                metadata: &mut Vec<(String, Vec<usize>)>,
+                name: &str,
+                shape: Vec<usize>| {
+        let n: usize = shape.iter().product();
+        let data: Vec<f32> = (0..n).map(|i| (i as f32) * 0.001).collect();
+        tensors.insert(name.into(), data);
+        metadata.push((name.into(), shape));
+    };
+
+    // Core Gemma 4 tensors (with the multimodal `model.language_model.` prefix
+    // the arch strips on load). Attn/FFN dims kept small but 256-aligned.
+    push(
+        &mut tensors,
+        &mut metadata,
+        "model.language_model.embed_tokens.weight",
+        vec![vocab, hidden],
+    );
+    push(
+        &mut tensors,
+        &mut metadata,
+        "model.language_model.norm.weight",
+        vec![hidden],
+    );
+
+    for layer in 0..num_layers {
+        let lp = format!("model.language_model.layers.{layer}");
+        push(
+            &mut tensors,
+            &mut metadata,
+            &format!("{lp}.self_attn.q_proj.weight"),
+            vec![hidden, hidden],
+        );
+        push(
+            &mut tensors,
+            &mut metadata,
+            &format!("{lp}.self_attn.k_proj.weight"),
+            vec![hidden, hidden],
+        );
+        push(
+            &mut tensors,
+            &mut metadata,
+            &format!("{lp}.self_attn.v_proj.weight"),
+            vec![hidden, hidden],
+        );
+        push(
+            &mut tensors,
+            &mut metadata,
+            &format!("{lp}.self_attn.o_proj.weight"),
+            vec![hidden, hidden],
+        );
+        push(
+            &mut tensors,
+            &mut metadata,
+            &format!("{lp}.mlp.gate_proj.weight"),
+            vec![intermediate, hidden],
+        );
+        push(
+            &mut tensors,
+            &mut metadata,
+            &format!("{lp}.mlp.up_proj.weight"),
+            vec![intermediate, hidden],
+        );
+        push(
+            &mut tensors,
+            &mut metadata,
+            &format!("{lp}.mlp.down_proj.weight"),
+            vec![hidden, intermediate],
+        );
+        push(
+            &mut tensors,
+            &mut metadata,
+            &format!("{lp}.input_layernorm.weight"),
+            vec![hidden],
+        );
+        push(
+            &mut tensors,
+            &mut metadata,
+            &format!("{lp}.post_attention_layernorm.weight"),
+            vec![hidden],
+        );
+        push(
+            &mut tensors,
+            &mut metadata,
+            &format!("{lp}.self_attn.q_norm.weight"),
+            vec![hidden],
+        );
+        push(
+            &mut tensors,
+            &mut metadata,
+            &format!("{lp}.self_attn.k_norm.weight"),
+            vec![hidden],
+        );
+
+        // ── PLE per-layer tensors (the regression surface) ──
+        push(
+            &mut tensors,
+            &mut metadata,
+            &format!("{lp}.per_layer_input_gate.weight"),
+            vec![ple_dim, hidden],
+        );
+        push(
+            &mut tensors,
+            &mut metadata,
+            &format!("{lp}.per_layer_projection.weight"),
+            vec![hidden, ple_dim],
+        );
+        push(
+            &mut tensors,
+            &mut metadata,
+            &format!("{lp}.post_per_layer_input_norm.weight"),
+            vec![hidden],
+        );
+    }
+
+    // ── PLE global tensors ──
+    push(
+        &mut tensors,
+        &mut metadata,
+        "model.language_model.per_layer_model_projection.weight",
+        vec![ple_dim * num_layers, hidden],
+    );
+    push(
+        &mut tensors,
+        &mut metadata,
+        "model.language_model.embed_tokens_per_layer.weight",
+        vec![vocab, ple_dim * num_layers],
+    );
+    push(
+        &mut tensors,
+        &mut metadata,
+        "model.language_model.per_layer_projection_norm.weight",
+        vec![ple_dim],
+    );
+
+    // Serialise as f32 safetensors.
+    let tensor_bytes: Vec<(String, Vec<u8>, Vec<usize>)> = metadata
+        .iter()
+        .map(|(name, shape)| {
+            let data = &tensors[name];
+            let bytes: Vec<u8> = data.iter().flat_map(|f| f.to_le_bytes()).collect();
+            (name.clone(), bytes, shape.clone())
+        })
+        .collect();
+    let views: Vec<(String, safetensors::tensor::TensorView<'_>)> = tensor_bytes
+        .iter()
+        .map(|(name, bytes, shape)| {
+            (
+                name.clone(),
+                safetensors::tensor::TensorView::new(safetensors::Dtype::F32, shape.clone(), bytes)
+                    .unwrap(),
+            )
+        })
+        .collect();
+    let serialized = safetensors::tensor::serialize(views, &None).unwrap();
+    std::fs::write(model_dir.join("model.safetensors"), &serialized).unwrap();
+
+    let tok_json =
+        r#"{"version":"1.0","model":{"type":"BPE","vocab":{},"merges":[]},"added_tokens":[]}"#;
+    std::fs::write(model_dir.join("tokenizer.json"), tok_json).unwrap();
+    let tokenizer = larql_vindex::tokenizers::Tokenizer::from_bytes(tok_json.as_bytes()).unwrap();
+
+    let mut cb = larql_vindex::SilentBuildCallbacks;
+    larql_vindex::build_vindex_streaming(
+        &model_dir,
+        &tokenizer,
+        "test/streaming-q4k-ple",
+        &output_dir,
+        5,
+        larql_vindex::ExtractLevel::Browse,
+        larql_vindex::StorageDtype::F32,
+        QuantFormat::Q4K,
+        larql_vindex::WriteWeightsOptions::default(),
+        larql_vindex::Q4kWriteOptions::default(),
+        false,
+        &mut cb,
+    )
+    .unwrap();
+
+    // ── ple_weights.bin must exist and the manifest must list all 3
+    //     global + (2 per-layer) PLE tensor entries as `tensor_q4k`. ──
+    assert!(
+        output_dir.join("ple_weights.bin").exists(),
+        "Q4 extract should emit ple_weights.bin when the arch has PLE"
+    );
+
+    let manifest_json = std::fs::read_to_string(output_dir.join("weight_manifest.json")).unwrap();
+    let manifest: Vec<serde_json::Value> = serde_json::from_str(&manifest_json).unwrap();
+    // PLE tensors are stored as f16 (not Q4_K) — Q4_K's per-super-block
+    // calibration zeros out the non-outlier cells of embedding-style
+    // tensors, compounding to garbage across Gemma 4 E2B's 35 layers.
+    let ple_tensor_keys: Vec<&str> = manifest
+        .iter()
+        .filter(|e| e["kind"] == "tensor_f16")
+        .filter_map(|e| e["key"].as_str())
+        .collect();
+
+    // 2 global tensors (per_layer_model_projection, embed_tokens_per_layer)
+    // + 2 per-layer tensors × num_layers. per_layer_projection_norm is a
+    // vector and belongs in norms.bin, not here.
+    assert_eq!(
+        ple_tensor_keys.len(),
+        2 + 2 * num_layers,
+        "expected {} PLE tensor_f16 entries, got: {:?}",
+        2 + 2 * num_layers,
+        ple_tensor_keys
+    );
+    assert!(
+        ple_tensor_keys.contains(&"per_layer_model_projection.weight"),
+        "global model projection missing from manifest"
+    );
+    assert!(
+        ple_tensor_keys.contains(&"embed_tokens_per_layer.weight"),
+        "global per-layer embed missing from manifest"
+    );
+
+    // ── post_per_layer_input_norm + per_layer_projection_norm must land
+    //     in norms.bin as vector entries. ──
+    let ple_vector_keys: Vec<&str> = manifest
+        .iter()
+        .filter(|e| e["kind"] == "vector")
+        .filter_map(|e| e["key"].as_str())
+        .filter(|k| k.contains("per_layer"))
+        .collect();
+    assert!(
+        ple_vector_keys.contains(&"per_layer_projection_norm.weight"),
+        "global PLE norm missing from norms.bin manifest: {ple_vector_keys:?}"
+    );
+    for layer in 0..num_layers {
+        let k = format!("layers.{layer}.post_per_layer_input_norm.weight");
+        assert!(
+            ple_vector_keys.iter().any(|v| *v == k),
+            "layer {layer} post-PLE norm missing: {ple_vector_keys:?}"
+        );
+    }
+
+    // ── Load back and verify the dequantised PLE tensors surface in
+    //     weights.tensors with the expected shapes. ──
+    let mut lcb = larql_vindex::SilentLoadCallbacks;
+    let weights = larql_vindex::load_model_weights_q4k(&output_dir, &mut lcb).unwrap();
+
+    let proj = weights
+        .tensors
+        .get("per_layer_model_projection.weight")
+        .expect("per_layer_model_projection missing after load");
+    assert_eq!(proj.shape(), &[ple_dim * num_layers, hidden]);
+
+    let embed_ple = weights
+        .tensors
+        .get("embed_tokens_per_layer.weight")
+        .expect("embed_tokens_per_layer missing after load");
+    assert_eq!(embed_ple.shape(), &[vocab, ple_dim * num_layers]);
+
+    for layer in 0..num_layers {
+        let gate_key = format!("layers.{layer}.per_layer_input_gate.weight");
+        let proj_key = format!("layers.{layer}.per_layer_projection.weight");
+        let gate = weights
+            .tensors
+            .get(&gate_key)
+            .unwrap_or_else(|| panic!("{gate_key} missing"));
+        assert_eq!(gate.shape(), &[ple_dim, hidden]);
+        let proj = weights
+            .tensors
+            .get(&proj_key)
+            .unwrap_or_else(|| panic!("{proj_key} missing"));
+        assert_eq!(proj.shape(), &[hidden, ple_dim]);
+    }
+
+    // Norms land in weights.vectors (f32 raw).
+    assert!(
+        weights
+            .vectors
+            .contains_key("per_layer_projection_norm.weight"),
+        "global PLE norm missing from loaded weights.vectors"
+    );
+
+    // final_logit_softcapping must survive the round-trip. Missing it
+    // lets predict_q4k peak the softmax on the wrong token.
+    let cfg = larql_vindex::load_vindex_config(&output_dir).unwrap();
+    assert_eq!(
+        cfg.model_config
+            .as_ref()
+            .and_then(|m| m.final_logit_softcapping),
+        Some(30.0),
+        "final_logit_softcapping dropped from vindex model_config"
+    );
+    assert_eq!(
+        weights.arch.final_logit_softcapping(),
+        Some(30.0),
+        "loaded arch must surface the softcap via final_logit_softcapping()"
+    );
+
+    let _ = std::fs::remove_dir_all(&model_dir);
+    let _ = std::fs::remove_dir_all(&output_dir);
+}
+
+// ─── Variable per-layer intermediate size (Gemma 4 E2B double-wide MLP) ──
+//
+// E2B's `use_double_wide_mlp=True` gives half the layers a 2× intermediate
+// dimension (6144 → 12288 on the real model). `predict_q4k` previously
+// hardcoded `weights.intermediate_size` for every layer's FFN dequant,
+// so the wide layers' weights were read at half-size and the forward
+// pass computed garbage. Fix: read per-layer feature count from the
+// vindex via `VectorIndex::num_features(layer)`. This test locks the
+// invariant that num_features matches the real per-layer shape so the
+// fix stays honest.
+#[test]
+fn streaming_extract_preserves_per_layer_intermediate_for_variable_ffn() {
+    use larql_vindex::QuantFormat;
+    use std::collections::HashMap;
+
+    let model_dir = std::env::temp_dir().join("larql_test_variable_ffn_model");
+    let output_dir = std::env::temp_dir().join("larql_test_variable_ffn_output");
+    let _ = std::fs::remove_dir_all(&model_dir);
+    let _ = std::fs::remove_dir_all(&output_dir);
+    std::fs::create_dir_all(&model_dir).unwrap();
+
+    let hidden = 256usize;
+    let num_layers = 4usize;
+    let vocab = 256usize;
+    // Layers 0,1 narrow (256), layers 2,3 double-wide (512). Matches the
+    // E2B pattern: the last half of the stack doubles the FFN width.
+    let intermediates = [256usize, 256, 512, 512];
+    let max_intermediate = *intermediates.iter().max().unwrap();
+
+    let config = serde_json::json!({
+        "model_type": "llama",
+        "hidden_size": hidden,
+        "intermediate_size": max_intermediate,
+        "num_hidden_layers": num_layers,
+        "num_attention_heads": 1,
+        "num_key_value_heads": 1,
+        "head_dim": hidden,
+        "vocab_size": vocab,
+    });
+    std::fs::write(
+        model_dir.join("config.json"),
+        serde_json::to_string(&config).unwrap(),
+    )
+    .unwrap();
+
+    let mut tensors: HashMap<String, Vec<f32>> = HashMap::new();
+    let mut metadata: Vec<(String, Vec<usize>)> = Vec::new();
+    let push = |tensors: &mut HashMap<String, Vec<f32>>,
+                metadata: &mut Vec<(String, Vec<usize>)>,
+                name: &str,
+                shape: Vec<usize>| {
+        let n: usize = shape.iter().product();
+        let data: Vec<f32> = (0..n).map(|i| (i as f32) * 0.001).collect();
+        tensors.insert(name.into(), data);
+        metadata.push((name.into(), shape));
+    };
+
+    push(
+        &mut tensors,
+        &mut metadata,
+        "model.embed_tokens.weight",
+        vec![vocab, hidden],
+    );
+    push(
+        &mut tensors,
+        &mut metadata,
+        "model.norm.weight",
+        vec![hidden],
+    );
+
+    for (layer, &inter) in intermediates.iter().enumerate() {
+        let lp = format!("model.layers.{layer}");
+        push(
+            &mut tensors,
+            &mut metadata,
+            &format!("{lp}.self_attn.q_proj.weight"),
+            vec![hidden, hidden],
+        );
+        push(
+            &mut tensors,
+            &mut metadata,
+            &format!("{lp}.self_attn.k_proj.weight"),
+            vec![hidden, hidden],
+        );
+        push(
+            &mut tensors,
+            &mut metadata,
+            &format!("{lp}.self_attn.v_proj.weight"),
+            vec![hidden, hidden],
+        );
+        push(
+            &mut tensors,
+            &mut metadata,
+            &format!("{lp}.self_attn.o_proj.weight"),
+            vec![hidden, hidden],
+        );
+        // Per-layer FFN width.
+        push(
+            &mut tensors,
+            &mut metadata,
+            &format!("{lp}.mlp.gate_proj.weight"),
+            vec![inter, hidden],
+        );
+        push(
+            &mut tensors,
+            &mut metadata,
+            &format!("{lp}.mlp.up_proj.weight"),
+            vec![inter, hidden],
+        );
+        push(
+            &mut tensors,
+            &mut metadata,
+            &format!("{lp}.mlp.down_proj.weight"),
+            vec![hidden, inter],
+        );
+        push(
+            &mut tensors,
+            &mut metadata,
+            &format!("{lp}.input_layernorm.weight"),
+            vec![hidden],
+        );
+        push(
+            &mut tensors,
+            &mut metadata,
+            &format!("{lp}.post_attention_layernorm.weight"),
+            vec![hidden],
+        );
+    }
+
+    let tensor_bytes: Vec<(String, Vec<u8>, Vec<usize>)> = metadata
+        .iter()
+        .map(|(name, shape)| {
+            let data = &tensors[name];
+            let bytes: Vec<u8> = data.iter().flat_map(|f| f.to_le_bytes()).collect();
+            (name.clone(), bytes, shape.clone())
+        })
+        .collect();
+    let views: Vec<(String, safetensors::tensor::TensorView<'_>)> = tensor_bytes
+        .iter()
+        .map(|(name, bytes, shape)| {
+            (
+                name.clone(),
+                safetensors::tensor::TensorView::new(safetensors::Dtype::F32, shape.clone(), bytes)
+                    .unwrap(),
+            )
+        })
+        .collect();
+    let serialized = safetensors::tensor::serialize(views, &None).unwrap();
+    std::fs::write(model_dir.join("model.safetensors"), &serialized).unwrap();
+
+    let tok_json =
+        r#"{"version":"1.0","model":{"type":"BPE","vocab":{},"merges":[]},"added_tokens":[]}"#;
+    std::fs::write(model_dir.join("tokenizer.json"), tok_json).unwrap();
+    let tokenizer = larql_vindex::tokenizers::Tokenizer::from_bytes(tok_json.as_bytes()).unwrap();
+
+    let mut cb = larql_vindex::SilentBuildCallbacks;
+    larql_vindex::build_vindex_streaming(
+        &model_dir,
+        &tokenizer,
+        "test/variable-ffn",
+        &output_dir,
+        5,
+        larql_vindex::ExtractLevel::Browse,
+        larql_vindex::StorageDtype::F32,
+        QuantFormat::Q4K,
+        larql_vindex::WriteWeightsOptions::default(),
+        larql_vindex::Q4kWriteOptions::default(),
+        false,
+        &mut cb,
+    )
+    .unwrap();
+
+    // ── Per-layer num_features in index.json ──
+    let cfg = larql_vindex::load_vindex_config(&output_dir).unwrap();
+    assert_eq!(cfg.layers.len(), num_layers);
+    for (layer, li) in cfg.layers.iter().enumerate() {
+        assert_eq!(
+            li.num_features, intermediates[layer],
+            "layer {layer} num_features must equal source FFN intermediate"
+        );
+    }
+
+    // ── VectorIndex::num_features(layer) — the accessor predict_q4k calls ──
+    let mut lcb = larql_vindex::SilentLoadCallbacks;
+    let index = larql_vindex::VectorIndex::load_vindex(&output_dir, &mut lcb).unwrap();
+    for (layer, &inter) in intermediates.iter().enumerate().take(num_layers) {
+        assert_eq!(
+            index.num_features(layer),
+            inter,
+            "VectorIndex::num_features(layer={layer}) wrong"
+        );
+    }
+
+    // ── FFN manifest shape — the raw Q4K bytes must match the per-layer
+    //     intermediate, NOT the model-wide max. Earlier predict_q4k bug:
+    //     dequantising with the wrong width silently produced half-width
+    //     weights on wide layers, so this assertion is the invariant. ──
+    let ff_manifest_json =
+        std::fs::read_to_string(output_dir.join("interleaved_q4k_manifest.json")).unwrap();
+    let ff_entries: Vec<serde_json::Value> = serde_json::from_str(&ff_manifest_json).unwrap();
+    for (layer, &inter) in intermediates.iter().enumerate() {
+        let base = layer * 3; // gate, up, down per layer
+        let gate_shape: Vec<usize> = ff_entries[base]["shape"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_u64().unwrap() as usize)
+            .collect();
+        let up_shape: Vec<usize> = ff_entries[base + 1]["shape"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_u64().unwrap() as usize)
+            .collect();
+        let down_shape: Vec<usize> = ff_entries[base + 2]["shape"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_u64().unwrap() as usize)
+            .collect();
+        assert_eq!(gate_shape, vec![inter, hidden], "layer {layer} gate shape");
+        assert_eq!(up_shape, vec![inter, hidden], "layer {layer} up shape");
+        assert_eq!(down_shape, vec![hidden, inter], "layer {layer} down shape");
+    }
+
+    let _ = std::fs::remove_dir_all(&model_dir);
+    let _ = std::fs::remove_dir_all(&output_dir);
 }

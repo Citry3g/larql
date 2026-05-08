@@ -1,6 +1,6 @@
 //! Fused QKV — llama.cpp's exact kernel_mul_mv_q4_K_f32, adapted for fused QKV.
 //!
-//! Uses GGUF block_q4_K_gguf (144 bytes) with packed 12-byte scales+mins.
+//! Uses GGUF `block_q4_K` (144 bytes) with packed 12-byte scales+mins.
 //! Inner loop matches llama.cpp byte-for-byte: no float() casts on nibbles,
 //! uint16_t mask extraction, FOR_UNROLL, register-based input.
 //!
@@ -46,20 +46,23 @@ kernel void q4kf_qkv_proj(
     const uint gguf_block_size = 144;  // GGUF Q4_K: 2+2+12+128
     const uint nb01 = nb * gguf_block_size;  // bytes per row
 
-    // Resolve 2 rows: pointers to weight data + output destinations
+    // Resolve 2 rows: pointers to weight data + output destinations +
+    // local row index (within the selected Q/K/V output buffer).
     device const uchar* wp[2];
     device float* op[2];
+    uint lri[2];
     bool valid[2];
     for (uint r = 0; r < 2; r++) {
         uint row = first_row + r;
         valid[r] = (row < total_rows);
-        uint lr;
+        uint lr = 0;
         device const uchar* base;
-        if (!valid[r]) { wp[r] = Wq; op[r] = Q_out; continue; }
+        if (!valid[r]) { wp[r] = Wq; op[r] = Q_out; lri[r] = 0; continue; }
         if (row < q_rows) { base = Wq; op[r] = Q_out; lr = row; }
         else if (row < q_rows + k_rows) { base = Wk; op[r] = K_out; lr = row - q_rows; }
         else { base = Wv; op[r] = V_out; lr = row - q_rows - k_rows; }
         wp[r] = base + lr * nb01;
+        lri[r] = lr;
     }
 
     // Input: register-based (llama.cpp pattern)
@@ -128,7 +131,12 @@ kernel void q4kf_qkv_proj(
     for (short row = 0; row < 2; row++) {
         if (!valid[row]) continue;
         float s = simd_sum(sumf[row]);
-        if (tiisg == 0) op[row][0] = s;  // write to resolved output position
+        // Write to the correct output slot. Every simdgroup previously wrote
+        // to `op[row][0]` — multiple SGs racing for index 0 meant only the
+        // first 4 Q rows / 4 K rows / 4 V rows ever held real values (the
+        // others were clobbered). Using `lri[row]` routes each simdgroup to
+        // its own output index.
+        if (tiisg == 0) op[row][lri[row]] = s;
     }
 }
 
@@ -218,5 +226,21 @@ kernel void q4kf_proj(
 }
 "#;
 
-pub const ROWS_PER_TG: u64 = 4;   // 2 SG × 2 rows/SG
-pub const THREADS_PER_TG: u64 = 64;  // 2 SG × 32 lanes
+pub const ROWS_PER_TG: u64 = 4; // 2 SG × 2 rows/SG
+pub const THREADS_PER_TG: u64 = 64; // 2 SG × 32 lanes
+
+/// Two kernels share this file's geometry — fused QKV projection
+/// (`q4kf_qkv_proj`) and the per-projection variant (`q4kf_proj`).
+pub struct QkvKernel;
+impl crate::metal::kernel::TiledKernel for QkvKernel {
+    const KERNEL_NAME: &'static str = "q4kf_qkv_proj";
+    const ROWS_PER_TG: u64 = ROWS_PER_TG;
+    const THREADS_PER_TG: u64 = THREADS_PER_TG;
+}
+
+pub struct ProjKernel;
+impl crate::metal::kernel::TiledKernel for ProjKernel {
+    const KERNEL_NAME: &'static str = "q4kf_proj";
+    const ROWS_PER_TG: u64 = ROWS_PER_TG;
+    const THREADS_PER_TG: u64 = THREADS_PER_TG;
+}

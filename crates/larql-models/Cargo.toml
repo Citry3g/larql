@@ -17,3 +17,11 @@ thiserror = { workspace = true }
 # Model weight loading
 safetensors = "0.5"
 memmap2 = "0.9"
+
+[dev-dependencies]
+criterion = "0.5"
+tempfile = "3"
+
+[[bench]]
+name = "models"
+harness = false

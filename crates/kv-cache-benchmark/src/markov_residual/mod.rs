@@ -1,8 +1,8 @@
-pub mod window;
 pub mod checkpoint;
 pub mod cold_tier;
+pub mod window;
 
-use crate::{KvStrategy, model_config::ModelConfig};
+use crate::{model_config::ModelConfig, KvStrategy};
 
 /// Strategy 3: Markov Residual Stream.
 ///
@@ -33,21 +33,21 @@ impl MarkovResidual {
 
     /// Memory for the active window (residual vectors for recent tokens).
     fn window_bytes(&self, config: &ModelConfig) -> usize {
-        // window_size tokens × hidden_dim × f32 (4 bytes)
-        self.window_size * config.hidden_dim * 4
+        // window_size tokens × num_layers × hidden_dim × f32 (4 bytes)
+        // Each layer stores one residual vector per active window position.
+        self.window_size * config.layers * config.hidden_dim * 4
     }
 
     /// Memory for checkpoints (residual snapshots at key layers).
     fn checkpoint_bytes(&self, config: &ModelConfig, seq_len: usize) -> usize {
-        // checkpoints × seq_len × hidden_dim × 2 (fp16)
-        // But only for active window — cold tier tokens don't have checkpoints
+        // checkpoints × active_window_tokens × hidden_dim × 2 (fp16)
         let active = seq_len.min(self.window_size);
         self.checkpoint_layers.len() * active * config.hidden_dim * 2
     }
 
     /// Memory for cold tier (token IDs only).
     fn cold_tier_bytes(&self, seq_len: usize) -> usize {
-        // All tokens stored as u32 IDs
+        // All tokens stored as u32 IDs (4 bytes).
         seq_len * 4
     }
 }
@@ -73,11 +73,7 @@ impl KvStrategy for MarkovResidual {
         buf.extend_from_slice(&(window as u32).to_le_bytes());
 
         // Active window: store last W key vectors as residual proxies
-        let start = if total_vectors > self.window_size {
-            total_vectors - self.window_size
-        } else {
-            0
-        };
+        let start = total_vectors.saturating_sub(self.window_size);
         for v in &keys[start..] {
             for &x in v {
                 buf.extend_from_slice(&x.to_le_bytes());
@@ -93,7 +89,12 @@ impl KvStrategy for MarkovResidual {
         buf
     }
 
-    fn decode(&self, encoded: &[u8], num_vectors: usize, dim: usize) -> (Vec<Vec<f32>>, Vec<Vec<f32>>) {
+    fn decode(
+        &self,
+        encoded: &[u8],
+        num_vectors: usize,
+        dim: usize,
+    ) -> (Vec<Vec<f32>>, Vec<Vec<f32>>) {
         let total = u32::from_le_bytes([encoded[0], encoded[1], encoded[2], encoded[3]]) as usize;
         let window = u32::from_le_bytes([encoded[4], encoded[5], encoded[6], encoded[7]]) as usize;
 
@@ -114,7 +115,12 @@ impl KvStrategy for MarkovResidual {
             let mut v = Vec::with_capacity(dim);
             for j in 0..dim {
                 let o = offset + j * 4;
-                let x = f32::from_le_bytes([encoded[o], encoded[o + 1], encoded[o + 2], encoded[o + 3]]);
+                let x = f32::from_le_bytes([
+                    encoded[o],
+                    encoded[o + 1],
+                    encoded[o + 2],
+                    encoded[o + 3],
+                ]);
                 v.push(x);
             }
             keys.push(v.clone());
@@ -125,7 +131,9 @@ impl KvStrategy for MarkovResidual {
     }
 
     fn memory_bytes(&self, config: &ModelConfig, seq_len: usize) -> usize {
-        self.window_bytes(config) + self.checkpoint_bytes(config, seq_len) + self.cold_tier_bytes(seq_len)
+        self.window_bytes(config)
+            + self.checkpoint_bytes(config, seq_len)
+            + self.cold_tier_bytes(seq_len)
     }
 }
 
@@ -138,17 +146,19 @@ mod tests {
         let strategy = MarkovResidual::new(512);
         let config = ModelConfig::gemma_4b();
 
-        let mem_4k = strategy.memory_bytes(&config, 4096);
+        let _mem_4k = strategy.memory_bytes(&config, 4096);
         let mem_370k = strategy.memory_bytes(&config, 370_000);
 
-        // Cold tier grows linearly but is only 4 bytes/token
-        // Window + checkpoints are bounded
-        let window_fixed = strategy.window_bytes(&config);
-        let checkpoint_fixed = strategy.checkpoint_bytes(&config, 370_000);
+        // Hot window dominates (window × layers × hidden × 4): bounded regardless of seq_len.
+        // Cold tier token IDs grow linearly at 4 bytes/token.
+        let _window_fixed = strategy.window_bytes(&config);
+        let _checkpoint_fixed = strategy.checkpoint_bytes(&config, 370_000);
 
-        // Most of the memory at 370K should be cold tier (370K × 4 = 1.48 MB)
         let cold_370k = strategy.cold_tier_bytes(370_000);
-        assert!(cold_370k < 2_000_000, "Cold tier should be < 2MB at 370K");
+        assert!(
+            cold_370k < 2_000_000,
+            "Cold tier (token IDs) should be < 2MB at 370K"
+        );
 
         // Total should be WAY less than standard KV
         let standard_mem = config.kv_memory(370_000);

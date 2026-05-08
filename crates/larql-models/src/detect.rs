@@ -14,7 +14,9 @@ use crate::architectures::mistral::MistralArch;
 use crate::architectures::mixtral::MixtralArch;
 use crate::architectures::qwen::QwenArch;
 use crate::architectures::starcoder2::StarCoder2Arch;
+use crate::architectures::tinymodel::TinyModelArch;
 use crate::config::{ModelArchitecture, ModelConfig, RopeScaling};
+use crate::validation::ConfigValidationError;
 
 /// Error from model detection/config parsing.
 #[derive(Debug, thiserror::Error)]
@@ -33,19 +35,32 @@ pub enum ModelError {
     NotADirectory(std::path::PathBuf),
     #[error("no safetensors files in {0}")]
     NoSafetensors(std::path::PathBuf),
+    #[error("config validation failed: {0:?}")]
+    ConfigValidation(Vec<ConfigValidationError>),
 }
 
 /// Read config.json from a model directory and return the architecture.
 pub fn detect_architecture(model_dir: &Path) -> Result<Box<dyn ModelArchitecture>, ModelError> {
-    let config_path = model_dir.join("config.json");
-    let config_json = if config_path.exists() {
-        let text = std::fs::read_to_string(&config_path)?;
-        serde_json::from_str::<serde_json::Value>(&text)?
-    } else {
-        serde_json::json!({})
-    };
-
+    let config_json = read_config_json(model_dir)?;
     Ok(detect_from_json(&config_json))
+}
+
+/// Read config.json from a model directory, detect the architecture, and validate it.
+pub fn detect_architecture_validated(
+    model_dir: &Path,
+) -> Result<Box<dyn ModelArchitecture>, ModelError> {
+    let arch = detect_architecture(model_dir)?;
+    validate_detected_architecture(arch)
+}
+
+fn read_config_json(model_dir: &Path) -> Result<serde_json::Value, ModelError> {
+    let config_path = model_dir.join("config.json");
+    if config_path.exists() {
+        let text = std::fs::read_to_string(&config_path)?;
+        Ok(serde_json::from_str::<serde_json::Value>(&text)?)
+    } else {
+        Ok(serde_json::json!({}))
+    }
 }
 
 /// Detect architecture from an already-parsed config.json value.
@@ -57,7 +72,9 @@ pub fn detect_from_json(config: &serde_json::Value) -> Box<dyn ModelArchitecture
         // Gemma family
         t if t.starts_with("gemma4") => Box::new(Gemma4Arch::from_config(model_config)),
         t if t.starts_with("gemma3") => Box::new(Gemma3Arch::from_config(model_config)),
-        t if t.starts_with("gemma2") || t == "gemma" => Box::new(Gemma2Arch::from_config(model_config)),
+        t if t.starts_with("gemma2") || t == "gemma" => {
+            Box::new(Gemma2Arch::from_config(model_config))
+        }
         // Llama family
         t if t.starts_with("llama") => Box::new(LlamaArch::from_config(model_config)),
         // Mistral (dense)
@@ -74,9 +91,49 @@ pub fn detect_from_json(config: &serde_json::Value) -> Box<dyn ModelArchitecture
         "starcoder2" => Box::new(StarCoder2Arch::from_config(model_config)),
         // Granite family (dense and MoE share same base keys)
         t if t.starts_with("granite") => Box::new(GraniteArch::from_config(model_config)),
+        // TinyModel — research-scale decoder used for LARQL compile/walk work
+        "tinymodel" => Box::new(TinyModelArch::from_config(model_config)),
         // Unknown — generic fallback
         _ => Box::new(GenericArch::from_config(model_config)),
     }
+}
+
+/// Detect architecture from an already-parsed config.json value and validate it.
+pub fn detect_from_json_validated(
+    config: &serde_json::Value,
+) -> Result<Box<dyn ModelArchitecture>, ModelError> {
+    let arch = detect_from_json(config);
+    validate_detected_architecture(arch)
+}
+
+pub(crate) fn validate_detected_architecture(
+    arch: Box<dyn ModelArchitecture>,
+) -> Result<Box<dyn ModelArchitecture>, ModelError> {
+    match arch.validate() {
+        Ok(()) => Ok(arch),
+        Err(errors) => Err(ModelError::ConfigValidation(errors)),
+    }
+}
+
+// ── RoPE base defaults ───────────────────────────────────────────────────────
+/// Default RoPE theta for Gemma family models.
+const ROPE_BASE_GEMMA: f64 = 1_000_000.0;
+/// Default RoPE theta for all other model families.
+const ROPE_BASE_DEFAULT: f64 = 10_000.0;
+
+// ── Config field name aliases ────────────────────────────────────────────────
+// Different model families use different JSON keys for the same concept.
+// Ordering is priority: first match wins.
+
+/// Total routed expert count: DeepSeek, Qwen MoE, Mixtral variants.
+const NUM_EXPERTS_KEYS: &[&str] = &["n_routed_experts", "num_local_experts", "num_experts"];
+
+/// Experts activated per token: llama.cpp / HF spelling variants.
+const NUM_EXPERTS_PER_TOK_KEYS: &[&str] = &["num_experts_per_tok", "num_experts_per_token"];
+
+/// Return the first `u64` found under any of `keys` in `config`.
+fn field_u64(config: &serde_json::Value, keys: &[&str]) -> Option<u64> {
+    keys.iter().find_map(|k| config[k].as_u64())
 }
 
 /// Parse ModelConfig from a config.json value.
@@ -93,7 +150,11 @@ fn parse_model_config(config: &serde_json::Value) -> ModelConfig {
 
     // Pick defaults based on model type.
     let is_gemma = model_type.starts_with("gemma");
-    let rope_default = if is_gemma { 1_000_000.0 } else { 10_000.0 };
+    let rope_default = if is_gemma {
+        ROPE_BASE_GEMMA
+    } else {
+        ROPE_BASE_DEFAULT
+    };
 
     let num_layers = text_config["num_hidden_layers"].as_u64().unwrap_or(32) as usize;
     let hidden_size = text_config["hidden_size"].as_u64().unwrap_or(2048) as usize;
@@ -106,7 +167,11 @@ fn parse_model_config(config: &serde_json::Value) -> ModelConfig {
     let head_dim = text_config["head_dim"]
         .as_u64()
         .map(|v| v as usize)
-        .unwrap_or(if default_head_dim > 0 { default_head_dim } else { hidden_size / num_q_heads });
+        .unwrap_or(if default_head_dim > 0 {
+            default_head_dim
+        } else {
+            hidden_size.checked_div(num_q_heads).unwrap_or(0)
+        });
     let num_kv_heads = text_config["num_key_value_heads"].as_u64().unwrap_or(4) as usize;
     // RoPE base: check rope_parameters.full_attention.rope_theta (Gemma 4),
     // then top-level rope_theta, then default.
@@ -126,15 +191,14 @@ fn parse_model_config(config: &serde_json::Value) -> ModelConfig {
     let sliding_window = text_config["sliding_window"].as_u64().map(|v| v as usize);
 
     // MoE fields
-    let num_experts = text_config["n_routed_experts"]
-        .as_u64()
-        .or_else(|| text_config["num_local_experts"].as_u64())
-        .map(|v| v as usize);
-    let num_experts_per_token = text_config["num_experts_per_tok"]
-        .as_u64()
-        .or_else(|| text_config["num_experts_per_token"].as_u64())
-        .map(|v| v as usize);
-    let num_shared_experts = text_config["n_shared_experts"]
+    let num_experts = field_u64(text_config, NUM_EXPERTS_KEYS).map(|v| v as usize);
+    let num_experts_per_token =
+        field_u64(text_config, NUM_EXPERTS_PER_TOK_KEYS).map(|v| v as usize);
+    let num_shared_experts = text_config["n_shared_experts"].as_u64().map(|v| v as usize);
+    // Gemma 4 A4B hybrid MoE fields
+    let enable_moe_block = text_config["enable_moe_block"].as_bool().unwrap_or(false);
+    let top_k_experts = text_config["top_k_experts"].as_u64().map(|v| v as usize);
+    let moe_intermediate_size = text_config["moe_intermediate_size"]
         .as_u64()
         .map(|v| v as usize);
 
@@ -237,6 +301,9 @@ fn parse_model_config(config: &serde_json::Value) -> ModelConfig {
         attention_k_eq_v,
         per_layer_embed_dim,
         num_kv_shared_layers,
+        enable_moe_block,
+        top_k_experts,
+        moe_intermediate_size,
     }
 }
 
@@ -293,6 +360,149 @@ mod tests {
     }
 
     #[test]
+    fn test_detect_tinymodel() {
+        let config = serde_json::json!({
+            "model_type": "tinymodel",
+            "hidden_size": 512,
+            "num_hidden_layers": 20,
+            "intermediate_size": 2048,
+            "num_attention_heads": 8,
+            "num_key_value_heads": 4,
+            "vocab_size": 71261,
+            "max_position_embeddings": 256
+        });
+
+        let arch = detect_from_json(&config);
+        assert_eq!(arch.family(), "tinymodel");
+        assert_eq!(arch.config().hidden_size, 512);
+        assert_eq!(arch.config().num_layers, 20);
+        assert_eq!(arch.config().rope_base, 10_000.0);
+        assert_eq!(arch.embed_scale(), (512.0_f32).sqrt());
+        assert_eq!(arch.embed_key(), "embed.weight");
+        assert_eq!(arch.final_norm_key(), "norm.weight");
+        assert_eq!(arch.attn_q_key(5), "layers.5.attn.q_proj.weight");
+        assert_eq!(arch.ffn_gate_key(5), "layers.5.ffn.gate.weight");
+        assert_eq!(arch.ffn_down_key(5), "layers.5.ffn.down.weight");
+        assert_eq!(arch.input_layernorm_key(5), "layers.5.attn_norm.weight");
+        assert_eq!(
+            arch.post_attention_layernorm_key(5),
+            "layers.5.ffn_norm.weight"
+        );
+        assert_eq!(arch.key_prefixes_to_strip(), &[] as &[&str]);
+        assert!(!arch.has_post_norms());
+    }
+
+    #[test]
+    fn test_tinymodel_full_key_coverage() {
+        let config = serde_json::json!({
+            "model_type": "tinymodel",
+            "hidden_size": 512,
+            "num_hidden_layers": 20,
+            "intermediate_size": 2048,
+            "num_attention_heads": 8,
+            "num_key_value_heads": 4,
+        });
+        let arch = detect_from_json(&config);
+
+        // Complete attention key set
+        assert_eq!(arch.attn_q_key(7), "layers.7.attn.q_proj.weight");
+        assert_eq!(arch.attn_k_key(7), "layers.7.attn.k_proj.weight");
+        assert_eq!(arch.attn_v_key(7), "layers.7.attn.v_proj.weight");
+        assert_eq!(arch.attn_o_key(7), "layers.7.attn.o_proj.weight");
+
+        // Complete FFN key set
+        assert_eq!(arch.ffn_gate_key(7), "layers.7.ffn.gate.weight");
+        assert_eq!(arch.ffn_up_key(7), "layers.7.ffn.up.weight");
+        assert_eq!(arch.ffn_down_key(7), "layers.7.ffn.down.weight");
+
+        // Not MoE, not MLA, no QK norm
+        assert!(!arch.is_moe());
+        assert!(!arch.uses_mla());
+        assert!(arch.attn_q_norm_key(0).is_none());
+        assert!(arch.attn_k_norm_key(0).is_none());
+    }
+
+    #[test]
+    fn test_gemma4_key_formats() {
+        let config = serde_json::json!({
+            "model_type": "gemma4",
+            "text_config": {
+                "model_type": "gemma4_text",
+                "hidden_size": 1536,
+                "intermediate_size": 6144,
+                "num_hidden_layers": 8,
+                "num_attention_heads": 8,
+                "num_key_value_heads": 1,
+                "head_dim": 256,
+            }
+        });
+        let arch = detect_from_json(&config);
+
+        // Gemma 4 uses HF-style llama keys (no architecture-specific override in gemma4.rs)
+        assert_eq!(arch.attn_q_key(3), "layers.3.self_attn.q_proj.weight");
+        assert_eq!(arch.attn_k_key(3), "layers.3.self_attn.k_proj.weight");
+        assert_eq!(arch.attn_v_key(3), "layers.3.self_attn.v_proj.weight");
+        assert_eq!(arch.attn_o_key(3), "layers.3.self_attn.o_proj.weight");
+        assert_eq!(arch.ffn_gate_key(3), "layers.3.mlp.gate_proj.weight");
+        assert_eq!(arch.ffn_up_key(3), "layers.3.mlp.up_proj.weight");
+        assert_eq!(arch.ffn_down_key(3), "layers.3.mlp.down_proj.weight");
+
+        // Multimodal wrapper prefixes (stripped on load)
+        let prefixes = arch.key_prefixes_to_strip();
+        assert!(prefixes.contains(&"model.language_model.model."));
+        assert!(prefixes.contains(&"model.language_model."));
+        assert!(prefixes.contains(&"language_model.model."));
+        assert!(prefixes.contains(&"model."));
+
+        // QK norm keys (inherited from Gemma 3)
+        assert_eq!(
+            arch.attn_q_norm_key(3),
+            Some("layers.3.self_attn.q_norm.weight".to_string())
+        );
+        assert_eq!(
+            arch.attn_k_norm_key(3),
+            Some("layers.3.self_attn.k_norm.weight".to_string())
+        );
+
+        // Gemma 4's shipped tokenizer.json drops BOS from its post-processor
+        // `single` template (Gemma 2/3 kept it), so the arch must advertise
+        // the BOS id so the inference tokenizer helper can prepend it.
+        assert_eq!(arch.bos_token_id(), Some(2));
+    }
+
+    #[test]
+    fn test_bos_token_id_gemma4_only() {
+        // Only Gemma 4 advertises an explicit BOS id — every other
+        // architecture's tokenizer.json already includes BOS in its
+        // post-processor so callers don't need to prepend it.
+        let non_gemma4 = [
+            serde_json::json!({"model_type": "llama", "hidden_size": 4096,
+                "num_hidden_layers": 32, "intermediate_size": 14336,
+                "num_attention_heads": 32, "num_key_value_heads": 8}),
+            serde_json::json!({"model_type": "gemma3", "hidden_size": 2560,
+                "num_hidden_layers": 34}),
+            serde_json::json!({"model_type": "gemma2", "hidden_size": 2304,
+                "num_hidden_layers": 26}),
+            serde_json::json!({"model_type": "mistral", "hidden_size": 4096,
+                "num_hidden_layers": 32}),
+            serde_json::json!({"model_type": "qwen2", "hidden_size": 2048,
+                "num_hidden_layers": 24, "intermediate_size": 5504,
+                "num_attention_heads": 16, "num_key_value_heads": 2}),
+            serde_json::json!({"model_type": "tinymodel", "hidden_size": 512,
+                "num_hidden_layers": 20, "intermediate_size": 2048,
+                "num_attention_heads": 8, "num_key_value_heads": 4}),
+        ];
+        for cfg in &non_gemma4 {
+            let arch = detect_from_json(cfg);
+            assert!(
+                arch.bos_token_id().is_none(),
+                "{} should not advertise a BOS id",
+                arch.family()
+            );
+        }
+    }
+
+    #[test]
     fn test_detect_mistral() {
         let config = serde_json::json!({
             "model_type": "mistral",
@@ -326,6 +536,43 @@ mod tests {
 
         let arch = detect_from_json(&config);
         assert_eq!(arch.family(), "qwen3");
+        assert!(!arch.is_moe());
+    }
+
+    #[test]
+    fn test_detect_qwen3_moe_30b() {
+        // Matches Qwen/Qwen3-30B-A3B config.json
+        let config = serde_json::json!({
+            "model_type": "qwen3_moe",
+            "hidden_size": 2048,
+            "intermediate_size": 6144,
+            "moe_intermediate_size": 768,
+            "num_hidden_layers": 48,
+            "num_attention_heads": 32,
+            "num_key_value_heads": 8,
+            "num_experts": 128,
+            "num_experts_per_tok": 8
+        });
+
+        let arch = detect_from_json(&config);
+        assert!(arch.is_moe());
+        assert!(!arch.is_hybrid_moe());
+        assert_eq!(arch.num_experts(), 128);
+        assert_eq!(arch.num_experts_per_token(), 8);
+        assert_eq!(arch.moe_intermediate_size(), 768);
+        assert_eq!(arch.moe_router_key(0).unwrap(), "layers.0.mlp.gate.weight");
+        assert_eq!(
+            arch.expert_ffn_gate_key(0, 5).unwrap(),
+            "layers.0.mlp.experts.5.gate_proj.weight"
+        );
+        assert_eq!(
+            arch.expert_ffn_up_key(0, 5).unwrap(),
+            "layers.0.mlp.experts.5.up_proj.weight"
+        );
+        assert_eq!(
+            arch.expert_ffn_down_key(0, 5).unwrap(),
+            "layers.0.mlp.experts.5.down_proj.weight"
+        );
     }
 
     #[test]
@@ -379,7 +626,7 @@ mod tests {
         assert_eq!(arch.config().hidden_size, 4096);
         assert_eq!(arch.config().num_q_heads, 32);
         assert_eq!(arch.config().num_kv_heads, 32); // no GQA in Llama 2
-        // head_dim computed: 4096 / 32 = 128
+                                                    // head_dim computed: 4096 / 32 = 128
         assert_eq!(arch.config().head_dim, 128);
         // rope_theta absent → defaults to 10000
         assert_eq!(arch.config().rope_base, 10_000.0);
@@ -906,10 +1153,12 @@ mod tests {
         assert_eq!(arch.attention_scale_for_layer(0), 1.0);
         assert_eq!(arch.attention_scale_for_layer(5), 1.0);
 
-        // K=V flag parsed — v_shares_k() exposes it via the trait
+        // K=V flag parsed — v_shares_k() exposes it via the trait.
+        // On 31B, attention_k_eq_v=true applies only to global (full_attention) layers;
+        // sliding layers still ship v_proj in safetensors.
         assert!(arch.config().attention_k_eq_v);
-        assert!(arch.v_shares_k(0));
-        assert!(arch.v_shares_k(5));
+        assert!(!arch.v_shares_k(0)); // sliding
+        assert!(arch.v_shares_k(5)); // global
 
         // V-norm (parameter-free RMSNorm on V states)
         assert!(arch.has_v_norm());
@@ -1024,13 +1273,16 @@ mod tests {
     #[test]
     fn test_detect_gemma4_real_config() {
         // Test against the actual HuggingFace config.json if available
-        let config_path = std::env::var("HOME").ok()
-            .map(|h| std::path::PathBuf::from(h).join(".cache/huggingface/hub/models--google--gemma-4-31B-it"));
+        let config_path = std::env::var("HOME").ok().map(|h| {
+            std::path::PathBuf::from(h)
+                .join(".cache/huggingface/hub/models--google--gemma-4-31B-it")
+        });
         let config_path = match config_path {
             Some(p) if p.exists() => {
                 // Find the snapshot
                 let snapshots = p.join("snapshots");
-                std::fs::read_dir(&snapshots).ok()
+                std::fs::read_dir(&snapshots)
+                    .ok()
                     .and_then(|mut entries| entries.next())
                     .and_then(|e| e.ok())
                     .map(|e| e.path().join("config.json"))
@@ -1072,6 +1324,108 @@ mod tests {
         // RoPE bases from rope_parameters
         assert_eq!(arch.rope_base_for_layer(0), 10_000.0);
         assert_eq!(arch.rope_base_for_layer(5), 1_000_000.0);
+    }
+
+    #[test]
+    fn test_detect_gemma4_26b_a4b() {
+        // Gemma 4 26B A4B — hybrid dense-MLP + MoE per layer.
+        // Architecture: 30 layers, hidden=2816, dense_intermediate=9216,
+        // 128 experts each with moe_intermediate=704, top_k=8.
+        let config = serde_json::json!({
+            "model_type": "gemma4",
+            "text_config": {
+                "model_type": "gemma4_text",
+                "hidden_size": 2816,
+                "intermediate_size": 9216,
+                "num_hidden_layers": 30,
+                "num_attention_heads": 16,
+                "num_key_value_heads": 8,
+                "head_dim": 256,
+                "global_head_dim": 512,
+                "num_global_key_value_heads": 4,
+                "vocab_size": 262144,
+                "enable_moe_block": true,
+                "num_experts": 128,
+                "top_k_experts": 8,
+                "moe_intermediate_size": 704,
+                "final_logit_softcapping": 30.0,
+                "rope_parameters": {
+                    "full_attention": {
+                        "partial_rotary_factor": 0.25,
+                        "rope_theta": 1000000.0
+                    },
+                    "sliding_attention": {
+                        "rope_theta": 10000.0
+                    }
+                }
+            }
+        });
+
+        let arch = detect_from_json(&config);
+        assert_eq!(arch.family(), "gemma4");
+        assert_eq!(arch.config().num_layers, 30);
+        assert_eq!(arch.config().hidden_size, 2816);
+        assert_eq!(arch.config().intermediate_size, 9216);
+
+        // MoE
+        assert!(arch.is_moe());
+        assert!(arch.is_hybrid_moe());
+        assert_eq!(arch.num_experts(), 128);
+        assert_eq!(arch.num_experts_per_token(), 8);
+        assert_eq!(arch.moe_intermediate_size(), 704);
+
+        // Router keys
+        assert_eq!(
+            arch.moe_router_key(0),
+            Some("layers.0.router.proj.weight".to_string())
+        );
+        assert_eq!(
+            arch.moe_router_scale_key(3),
+            Some("layers.3.router.scale".to_string())
+        );
+        assert_eq!(
+            arch.moe_router_per_expert_scale_key(3),
+            Some("layers.3.router.per_expert_scale".to_string())
+        );
+
+        // Packed expert keys
+        assert_eq!(
+            arch.packed_experts_gate_up_key(5),
+            Some("layers.5.experts.gate_up_proj".to_string())
+        );
+        assert_eq!(
+            arch.packed_experts_down_key(5),
+            Some("layers.5.experts.down_proj".to_string())
+        );
+
+        // Hybrid MoE norm keys — dense branch gets _1 suffix
+        assert_eq!(
+            arch.post_feedforward_layernorm_key(0),
+            Some("layers.0.post_feedforward_layernorm_1.weight".to_string())
+        );
+        assert_eq!(
+            arch.moe_pre_experts_norm_key(0),
+            Some("layers.0.pre_feedforward_layernorm_2.weight".to_string())
+        );
+        assert_eq!(
+            arch.moe_post_experts_norm_key(0),
+            Some("layers.0.post_feedforward_layernorm_2.weight".to_string())
+        );
+
+        // Dense FFN keys still present (both branches coexist)
+        assert_eq!(arch.ffn_gate_key(0), "layers.0.mlp.gate_proj.weight");
+        assert_eq!(arch.ffn_up_key(0), "layers.0.mlp.up_proj.weight");
+        assert_eq!(arch.ffn_down_key(0), "layers.0.mlp.down_proj.weight");
+
+        // ExpertFormat
+        use crate::config::ExpertFormat;
+        assert_eq!(arch.expert_format(), ExpertFormat::PackedBF16);
+
+        // Gemma 4 features still work
+        assert_eq!(arch.norm_weight_offset(), 0.0);
+        assert!(arch.has_v_norm());
+        assert!(arch.has_post_norms());
+        assert_eq!(arch.bos_token_id(), Some(2));
     }
 
     #[test]

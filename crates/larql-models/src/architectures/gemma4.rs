@@ -15,7 +15,12 @@
 //! 2. `sliding_window_pattern` field (every Nth layer is full)
 //! 3. Default pattern of 6 (every 6th layer is full)
 
-use crate::config::{Activation, ModelArchitecture, ModelConfig};
+use crate::config::{Activation, ExpertFormat, ModelArchitecture, ModelConfig};
+
+/// Layer type string used in Gemma 4 `layer_types` config field.
+const LAYER_TYPE_FULL: &str = "full_attention";
+/// Default sliding-window period when not explicit in config.
+const DEFAULT_SLIDING_WINDOW_PATTERN: usize = 6;
 
 pub struct Gemma4Arch {
     config: ModelConfig,
@@ -31,11 +36,14 @@ impl Gemma4Arch {
 
         // Determine global layers from explicit layer_types or pattern
         let global_layers: Vec<bool> = if let Some(ref types) = config.layer_types {
-            types.iter()
-                .map(|t| t == "full_attention")
+            (0..num_layers)
+                .map(|layer| types.get(layer).is_some_and(|t| t == LAYER_TYPE_FULL))
                 .collect()
         } else {
-            let pattern = config.sliding_window_pattern.unwrap_or(6);
+            let pattern = config
+                .sliding_window_pattern
+                .filter(|&pattern| pattern > 0)
+                .unwrap_or(DEFAULT_SLIDING_WINDOW_PATTERN);
             (0..num_layers)
                 .map(|layer| (layer + 1) % pattern == 0)
                 .collect()
@@ -52,10 +60,8 @@ impl Gemma4Arch {
         };
         let kv_sources = if num_shared > 0 {
             // Find the last non-shared sliding and global layers
-            let last_sliding = (0..first_shared).rev()
-                .find(|&l| !global_layers[l]);
-            let last_global = (0..first_shared).rev()
-                .find(|&l| global_layers[l]);
+            let last_sliding = (0..first_shared).rev().find(|&l| !global_layers[l]);
+            let last_global = (0..first_shared).rev().find(|&l| global_layers[l]);
 
             (0..num_layers)
                 .map(|layer| {
@@ -95,7 +101,12 @@ impl ModelArchitecture for Gemma4Arch {
 
     /// Gemma 4 weights use `model.language_model.` prefix (multimodal wrapper).
     fn key_prefixes_to_strip(&self) -> &[&str] {
-        &["model.language_model.model.", "model.language_model.", "language_model.model.", "model."]
+        &[
+            "model.language_model.model.",
+            "model.language_model.",
+            "language_model.model.",
+            "model.",
+        ]
     }
 
     // ── Per-layer attention geometry ──
@@ -110,7 +121,9 @@ impl ModelArchitecture for Gemma4Arch {
 
     fn num_kv_heads_for_layer(&self, layer: usize) -> usize {
         if self.is_global_layer(layer) {
-            self.config.num_global_kv_heads.unwrap_or(self.config.num_kv_heads)
+            self.config
+                .num_global_kv_heads
+                .unwrap_or(self.config.num_kv_heads)
         } else {
             self.config.num_kv_heads
         }
@@ -131,8 +144,11 @@ impl ModelArchitecture for Gemma4Arch {
         }
     }
 
-    fn v_shares_k(&self, _layer: usize) -> bool {
-        self.config.attention_k_eq_v
+    fn v_shares_k(&self, layer: usize) -> bool {
+        // On 31B, attention_k_eq_v=true means V reuses K only on global (full_attention)
+        // layers — v_proj is still present on sliding layers. On E2B (attention_k_eq_v=false)
+        // this is always false. Per-layer gating matches what ships in the safetensors.
+        self.config.attention_k_eq_v && self.is_global_layer(layer)
     }
 
     fn has_v_norm(&self) -> bool {
@@ -189,6 +205,15 @@ impl ModelArchitecture for Gemma4Arch {
         (self.config.hidden_size as f32).sqrt()
     }
 
+    // Gemma 4's shipped `tokenizer.json` omits `<bos>` from its
+    // `TemplateProcessing.single` template (Gemma 2/3 included it), so
+    // `encode(prompt, add_special=true)` returns a sequence without the
+    // leading BOS token and the model's attention sees a broken prefix.
+    // Callers consult this to prepend token id 2 when missing.
+    fn bos_token_id(&self) -> Option<u32> {
+        Some(2)
+    }
+
     fn has_post_norms(&self) -> bool {
         true
     }
@@ -203,5 +228,165 @@ impl ModelArchitecture for Gemma4Arch {
         } else {
             self.config.rope_base
         }
+    }
+
+    // ── Hybrid MoE (26B A4B: dense MLP + expert block, outputs summed) ──
+
+    fn is_moe(&self) -> bool {
+        self.config.enable_moe_block
+    }
+
+    fn is_hybrid_moe(&self) -> bool {
+        self.config.enable_moe_block
+    }
+
+    fn expert_format(&self) -> ExpertFormat {
+        ExpertFormat::PackedBF16
+    }
+
+    fn num_experts(&self) -> usize {
+        self.config.num_experts.unwrap_or(0)
+    }
+
+    fn num_experts_per_token(&self) -> usize {
+        self.config
+            .top_k_experts
+            .or(self.config.num_experts_per_token)
+            .unwrap_or(0)
+    }
+
+    fn moe_intermediate_size(&self) -> usize {
+        self.config.moe_intermediate_size.unwrap_or(0)
+    }
+
+    fn moe_router_type(&self) -> &str {
+        if self.config.enable_moe_block {
+            "gemma4_top_k_softmax"
+        } else {
+            "top_k_softmax"
+        }
+    }
+
+    /// Router linear projection: selects top-k experts.
+    fn moe_router_key(&self, layer: usize) -> Option<String> {
+        if self.config.enable_moe_block {
+            Some(format!("{}router.proj.weight", self.layer_prefix(layer)))
+        } else {
+            None
+        }
+    }
+
+    fn moe_router_scale_key(&self, layer: usize) -> Option<String> {
+        if self.config.enable_moe_block {
+            Some(format!("{}router.scale", self.layer_prefix(layer)))
+        } else {
+            None
+        }
+    }
+
+    fn moe_router_per_expert_scale_key(&self, layer: usize) -> Option<String> {
+        if self.config.enable_moe_block {
+            Some(format!(
+                "{}router.per_expert_scale",
+                self.layer_prefix(layer)
+            ))
+        } else {
+            None
+        }
+    }
+
+    fn moe_router_norm_parameter_free(&self) -> bool {
+        // HF `Gemma4TextRouter` uses `Gemma4RMSNorm(with_scale=False)`, i.e.
+        // pure variance normalisation — no learned weight exists on disk.
+        self.config.enable_moe_block
+    }
+
+    fn moe_router_input_scalar(&self) -> Option<f32> {
+        if self.config.enable_moe_block {
+            Some((self.config.hidden_size as f32).powf(-0.5))
+        } else {
+            None
+        }
+    }
+
+    /// All experts' gate+up weights packed: [num_experts, 2*moe_intermediate, hidden].
+    fn packed_experts_gate_up_key(&self, layer: usize) -> Option<String> {
+        if self.config.enable_moe_block {
+            Some(format!("{}experts.gate_up_proj", self.layer_prefix(layer)))
+        } else {
+            None
+        }
+    }
+
+    /// All experts' down weights packed: [num_experts, hidden, moe_intermediate].
+    fn packed_experts_down_key(&self, layer: usize) -> Option<String> {
+        if self.config.enable_moe_block {
+            Some(format!("{}experts.down_proj", self.layer_prefix(layer)))
+        } else {
+            None
+        }
+    }
+
+    // In MoE layers, post_feedforward_layernorm becomes _1 (dense branch).
+    fn post_feedforward_layernorm_key(&self, layer: usize) -> Option<String> {
+        if self.config.enable_moe_block {
+            Some(format!(
+                "{}post_feedforward_layernorm_1.weight",
+                self.layer_prefix(layer)
+            ))
+        } else {
+            Some(format!(
+                "{}post_feedforward_layernorm.weight",
+                self.layer_prefix(layer)
+            ))
+        }
+    }
+
+    fn moe_pre_experts_norm_key(&self, layer: usize) -> Option<String> {
+        if self.config.enable_moe_block {
+            Some(format!(
+                "{}pre_feedforward_layernorm_2.weight",
+                self.layer_prefix(layer)
+            ))
+        } else {
+            None
+        }
+    }
+
+    fn moe_post_experts_norm_key(&self, layer: usize) -> Option<String> {
+        if self.config.enable_moe_block {
+            Some(format!(
+                "{}post_feedforward_layernorm_2.weight",
+                self.layer_prefix(layer)
+            ))
+        } else {
+            None
+        }
+    }
+
+    fn moe_post_ffn1_norm_key(&self, layer: usize) -> Option<String> {
+        // Alias for post_feedforward_layernorm_1 — same key, explicit name for clarity.
+        self.post_feedforward_layernorm_key(layer)
+    }
+
+    fn moe_post_outer_norm_key(&self, layer: usize) -> Option<String> {
+        if self.config.enable_moe_block {
+            Some(format!(
+                "{}post_feedforward_layernorm.weight",
+                self.layer_prefix(layer)
+            ))
+        } else {
+            None
+        }
+    }
+
+    fn moe_has_combined_output_norm(&self) -> bool {
+        // Gemma 4 hybrid MoE: after combining dense + expert outputs, apply
+        // post_feedforward_layernorm to the sum before adding to residual.
+        // Matches HF Gemma4TextDecoderLayer.forward():
+        //   hidden_states = h1 + h2
+        //   hidden_states = self.post_feedforward_layernorm(hidden_states)
+        //   hidden_states = residual + hidden_states
+        self.config.enable_moe_block
     }
 }

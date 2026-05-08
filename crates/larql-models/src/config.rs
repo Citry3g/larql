@@ -4,6 +4,8 @@
 //! describes *what the model is* — tensor key patterns, norm behavior,
 //! activation functions, scaling — without any compute dependencies.
 
+use crate::validation::ConfigValidationResult;
+
 /// Normalization type used by the model.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum NormType {
@@ -45,6 +47,11 @@ pub enum ExpertFormat {
     /// All experts fused into one tensor with block quantization.
     /// Keys: `experts.gate_up_proj_blocks`, `experts.gate_up_proj_scales`, etc.
     PackedMxfp4,
+    /// Packed BF16/F16 stacked tensors (Gemma 4 26B A4B).
+    /// All experts fused into one tensor per projection, no quantization scales.
+    /// Keys: `experts.gate_up_proj` [num_experts, 2*moe_intermediate, hidden],
+    ///        `experts.down_proj`   [num_experts, hidden, moe_intermediate].
+    PackedBF16,
 }
 
 /// RoPE scaling configuration (YaRN, linear, dynamic).
@@ -73,6 +80,12 @@ pub struct ModelConfig {
     pub num_experts: Option<usize>,
     pub num_experts_per_token: Option<usize>,
     pub num_shared_experts: Option<usize>,
+    /// Gemma 4 A4B: enables hybrid dense-MLP + MoE-experts block per layer.
+    pub enable_moe_block: bool,
+    /// Gemma 4 A4B: experts activated per token (stored as `top_k_experts` in config.json).
+    pub top_k_experts: Option<usize>,
+    /// Gemma 4 A4B: intermediate (hidden) dimension of each expert's FFN.
+    pub moe_intermediate_size: Option<usize>,
     // MLA fields
     pub kv_lora_rank: Option<usize>,
     pub q_lora_rank: Option<usize>,
@@ -120,6 +133,16 @@ pub trait ModelArchitecture: Send + Sync {
 
     /// Parsed model configuration.
     fn config(&self) -> &ModelConfig;
+
+    /// Validate parsed architecture dimensions and cross-field invariants.
+    ///
+    /// Detection is intentionally permissive so callers can inspect partially
+    /// specified configs. Call this before inference or extraction to fail
+    /// early on inconsistent head geometry, RoPE settings, per-layer metadata,
+    /// MoE routing, or other values that would otherwise surface later.
+    fn validate(&self) -> ConfigValidationResult {
+        crate::validation::validate_architecture(self)
+    }
 
     // ── Tensor key patterns ──
 
@@ -253,6 +276,19 @@ pub trait ModelArchitecture: Send + Sync {
             .embedding_multiplier
             .map(|v| v as f32)
             .unwrap_or(1.0)
+    }
+
+    /// BOS token to prepend before inference when the tokenizer's
+    /// `post_processor` doesn't already add one.
+    ///
+    /// Gemma 4's shipped `tokenizer.json` leaves BOS out of the
+    /// `TemplateProcessing.single` template (unlike Gemma 2/3), so
+    /// `tokenizer.encode(prompt, true)` returns tokens without BOS and
+    /// the model sees a broken sequence. Architectures that need BOS
+    /// return `Some(id)` here and callers prepend it if the encoding
+    /// doesn't already start with it.
+    fn bos_token_id(&self) -> Option<u32> {
+        None
     }
 
     /// Activation function for the FFN.
@@ -389,7 +425,10 @@ pub trait ModelArchitecture: Send + Sync {
     /// Key for the per-layer input gate projection [ple_dim, hidden].
     fn per_layer_input_gate_key(&self, layer: usize) -> Option<String> {
         if self.has_per_layer_embeddings() {
-            Some(format!("{}per_layer_input_gate.weight", self.layer_prefix(layer)))
+            Some(format!(
+                "{}per_layer_input_gate.weight",
+                self.layer_prefix(layer)
+            ))
         } else {
             None
         }
@@ -398,7 +437,10 @@ pub trait ModelArchitecture: Send + Sync {
     /// Key for the per-layer output projection [hidden, ple_dim].
     fn per_layer_projection_key(&self, layer: usize) -> Option<String> {
         if self.has_per_layer_embeddings() {
-            Some(format!("{}per_layer_projection.weight", self.layer_prefix(layer)))
+            Some(format!(
+                "{}per_layer_projection.weight",
+                self.layer_prefix(layer)
+            ))
         } else {
             None
         }
@@ -407,7 +449,10 @@ pub trait ModelArchitecture: Send + Sync {
     /// Key for the post-PLE norm weight.
     fn post_per_layer_input_norm_key(&self, layer: usize) -> Option<String> {
         if self.has_per_layer_embeddings() {
-            Some(format!("{}post_per_layer_input_norm.weight", self.layer_prefix(layer)))
+            Some(format!(
+                "{}post_per_layer_input_norm.weight",
+                self.layer_prefix(layer)
+            ))
         } else {
             None
         }
@@ -485,6 +530,12 @@ pub trait ModelArchitecture: Send + Sync {
         None
     }
 
+    /// Router algorithm identifier (written into MoeConfig.router_type in vindex).
+    /// Override in architectures with non-standard routing (e.g., Gemma 4's normalised softmax + per-expert scale).
+    fn moe_router_type(&self) -> &str {
+        "top_k_softmax"
+    }
+
     /// Expert FFN gate weight key.
     fn expert_ffn_gate_key(&self, _layer: usize, _expert_id: usize) -> Option<String> {
         None
@@ -503,13 +554,21 @@ pub trait ModelArchitecture: Send + Sync {
     // ── Packed expert keys (MXFP4 models) ──
 
     /// Packed gate+up projection blocks key (all experts fused, MXFP4).
-    fn packed_gate_up_blocks_key(&self, _layer: usize) -> Option<String> { None }
+    fn packed_gate_up_blocks_key(&self, _layer: usize) -> Option<String> {
+        None
+    }
     /// Packed gate+up projection scales key.
-    fn packed_gate_up_scales_key(&self, _layer: usize) -> Option<String> { None }
+    fn packed_gate_up_scales_key(&self, _layer: usize) -> Option<String> {
+        None
+    }
     /// Packed down projection blocks key.
-    fn packed_down_blocks_key(&self, _layer: usize) -> Option<String> { None }
+    fn packed_down_blocks_key(&self, _layer: usize) -> Option<String> {
+        None
+    }
     /// Packed down projection scales key.
-    fn packed_down_scales_key(&self, _layer: usize) -> Option<String> { None }
+    fn packed_down_scales_key(&self, _layer: usize) -> Option<String> {
+        None
+    }
 
     /// Shared expert FFN gate weight key.
     fn shared_expert_gate_key(&self, _layer: usize) -> Option<String> {
@@ -524,6 +583,106 @@ pub trait ModelArchitecture: Send + Sync {
     /// Shared expert FFN down-projection weight key.
     fn shared_expert_down_key(&self, _layer: usize) -> Option<String> {
         None
+    }
+
+    // ── Hybrid MoE (Gemma 4 A4B: dense MLP + expert block summed per layer) ──
+
+    /// Whether this model has a hybrid dense-MLP + expert block per layer.
+    /// Unlike pure MoE (Mixtral/DeepSeek), both branches run and their outputs are summed.
+    fn is_hybrid_moe(&self) -> bool {
+        false
+    }
+
+    /// Per-expert intermediate (hidden) dimension. 0 for non-MoE models.
+    fn moe_intermediate_size(&self) -> usize {
+        0
+    }
+
+    /// Packed stacked gate+up projection key (Gemma 4 PackedBF16 format).
+    /// Tensor shape: [num_experts, 2 * moe_intermediate_size, hidden_size].
+    fn packed_experts_gate_up_key(&self, _layer: usize) -> Option<String> {
+        None
+    }
+
+    /// Packed stacked down projection key (Gemma 4 PackedBF16 format).
+    /// Tensor shape: [num_experts, hidden_size, moe_intermediate_size].
+    fn packed_experts_down_key(&self, _layer: usize) -> Option<String> {
+        None
+    }
+
+    /// Gemma 4 router learned input-scale key (`router.scale`).
+    fn moe_router_scale_key(&self, _layer: usize) -> Option<String> {
+        None
+    }
+
+    /// Gemma 4 router per-expert output-scale key (`router.per_expert_scale`).
+    fn moe_router_per_expert_scale_key(&self, _layer: usize) -> Option<String> {
+        None
+    }
+
+    /// Router's own RMS-norm weight, applied to the router's input *before*
+    /// the router projection. HF Gemma 4's `Gemma4TextRouter.norm` is
+    /// **parameter-free** (`with_scale=False`) so no tensor exists on disk —
+    /// see [`moe_router_norm_parameter_free`](Self::moe_router_norm_parameter_free).
+    /// This key is provided for architectures that DO ship a learned router
+    /// norm weight. Return `None` to fall back to either parameter-free
+    /// RMSNorm (when the flag is set) or the experts' pre-norm output.
+    fn moe_router_norm_key(&self, _layer: usize) -> Option<String> {
+        None
+    }
+
+    /// Whether the router applies a parameter-free RMSNorm to its input
+    /// before `router_scale`/projection. Gemma 4 sets this true. When true
+    /// AND `moe_router_norm_key` returns `None`, the forward pass runs
+    /// `x / sqrt(mean(x²) + eps)` on the raw residual instead of reusing
+    /// the experts' pre-norm (which would apply the wrong learned weight).
+    fn moe_router_norm_parameter_free(&self) -> bool {
+        false
+    }
+
+    /// Scalar multiplier applied to the router input after `router.norm` and
+    /// after the learned `router.scale` vector. Gemma 4 uses `hidden_size^-0.5`
+    /// (called `scalar_root_size` in HF). Return `None` for no scaling.
+    fn moe_router_input_scalar(&self) -> Option<f32> {
+        None
+    }
+
+    /// Outer post-FFN norm for hybrid MoE layers — applied to `(h1 + h2)`
+    /// before the residual add, where `h1 = post_ffn_norm_1(dense)` and
+    /// `h2 = post_ffn_norm_2(moe)`. HF Gemma 4 stores this at the un-suffixed
+    /// key `post_feedforward_layernorm.weight`, while the dense-branch norm
+    /// uses the suffixed `_1` variant (see `post_feedforward_layernorm_key`).
+    /// Return `None` for architectures that either don't combine via an outer
+    /// norm or reuse the dense-branch norm as the outer norm.
+    fn moe_post_outer_norm_key(&self, _layer: usize) -> Option<String> {
+        None
+    }
+
+    /// Post-FFN norm for dense MLP output in hybrid MoE layers.
+    /// Gemma 4 A4B: `post_feedforward_layernorm_1.weight` (replaces the plain variant).
+    fn moe_post_ffn1_norm_key(&self, _layer: usize) -> Option<String> {
+        None
+    }
+
+    /// Pre-norm applied to the residual before feeding into the expert block.
+    /// Gemma 4 A4B: `pre_feedforward_layernorm_2.weight`.
+    fn moe_pre_experts_norm_key(&self, _layer: usize) -> Option<String> {
+        None
+    }
+
+    /// Post-norm applied to the expert block output.
+    /// Gemma 4 A4B: `post_feedforward_layernorm_2.weight`.
+    fn moe_post_experts_norm_key(&self, _layer: usize) -> Option<String> {
+        None
+    }
+
+    /// Whether the hybrid MoE forward applies a final RMS norm to the
+    /// combined (dense + expert) output before adding to the residual.
+    ///
+    /// Gemma 4 26B A4B: true — matches HF `post_feedforward_layernorm(combined)`.
+    /// All other models: false — use `layer_scalar * combined` instead.
+    fn moe_has_combined_output_norm(&self) -> bool {
+        false
     }
 
     // ── MLA (Multi-head Latent Attention) ──

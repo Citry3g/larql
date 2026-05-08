@@ -1,7 +1,6 @@
 # Rust
-/target/
+target/
 **/*.rs.bk
-Cargo.lock
 
 # Python / maturin
 .venv/
@@ -27,7 +26,14 @@ build/
 # Checkpoints / temp
 *.checkpoint
 
+# Nix
+result
+result-*
+
 # output
 output/
 data/
 experiments/
+vindexes/
+.pids/
+docs/replay/

@@ -1,8 +1,8 @@
-//! Lifecycle statement parsers: EXTRACT, COMPILE, DIFF, USE
+//! Lifecycle statement parsers: EXTRACT, COMPILE, DIFF, USE, COMPACT
 
+use super::{ParseError, Parser};
 use crate::ast::*;
 use crate::lexer::Keyword;
-use super::{Parser, ParseError};
 
 impl Parser {
     pub(crate) fn parse_extract(&mut self) -> Result<Statement, ParseError> {
@@ -46,7 +46,13 @@ impl Parser {
         }
 
         self.eat_semicolon();
-        Ok(Statement::Extract { model, output, components, layers, extract_level })
+        Ok(Statement::Extract {
+            model,
+            output,
+            components,
+            layers,
+            extract_level,
+        })
     }
 
     pub(crate) fn parse_compile(&mut self) -> Result<Statement, ParseError> {
@@ -87,43 +93,44 @@ impl Parser {
         // is a parse error so users get a clear message instead of silent acceptance.
         let mut on_conflict = None;
 
-        loop {
-            match self.peek() {
-                crate::lexer::Token::Keyword(Keyword::On) => {
+        while let crate::lexer::Token::Keyword(Keyword::On) = self.peek() {
+            self.advance();
+            self.expect_keyword(Keyword::Conflict)?;
+            let strat = match self.peek() {
+                crate::lexer::Token::Keyword(Keyword::LastWins) => {
                     self.advance();
-                    self.expect_keyword(Keyword::Conflict)?;
-                    let strat = match self.peek() {
-                        crate::lexer::Token::Keyword(Keyword::LastWins) => {
-                            self.advance();
-                            CompileConflict::LastWins
-                        }
-                        crate::lexer::Token::Keyword(Keyword::HighestConfidence) => {
-                            self.advance();
-                            CompileConflict::HighestConfidence
-                        }
-                        crate::lexer::Token::Keyword(Keyword::Fail) => {
-                            self.advance();
-                            CompileConflict::Fail
-                        }
-                        t => return Err(ParseError(format!(
-                            "expected LAST_WINS | HIGHEST_CONFIDENCE | FAIL after ON CONFLICT, got {:?}",
-                            t
-                        ))),
-                    };
-                    if target != CompileTarget::Vindex {
-                        return Err(ParseError(
-                            "ON CONFLICT is only valid for COMPILE INTO VINDEX".into(),
-                        ));
-                    }
-                    on_conflict = Some(strat);
+                    CompileConflict::LastWins
                 }
-                _ => break,
+                crate::lexer::Token::Keyword(Keyword::HighestConfidence) => {
+                    self.advance();
+                    CompileConflict::HighestConfidence
+                }
+                crate::lexer::Token::Keyword(Keyword::Fail) => {
+                    self.advance();
+                    CompileConflict::Fail
+                }
+                t => {
+                    return Err(ParseError(format!(
+                    "expected LAST_WINS | HIGHEST_CONFIDENCE | FAIL after ON CONFLICT, got {:?}",
+                    t
+                )))
+                }
+            };
+            if target != CompileTarget::Vindex {
+                return Err(ParseError(
+                    "ON CONFLICT is only valid for COMPILE INTO VINDEX".into(),
+                ));
             }
+            on_conflict = Some(strat);
         }
 
         self.eat_semicolon();
         Ok(Statement::Compile {
-            vindex, output, format, target, on_conflict,
+            vindex,
+            output,
+            format,
+            target,
+            on_conflict,
         })
     }
 
@@ -156,14 +163,28 @@ impl Parser {
                     self.expect_keyword(Keyword::Patch)?;
                     let path = self.expect_string()?;
                     self.eat_semicolon();
-                    return Ok(Statement::Diff { a, b, layer, relation, limit, into_patch: Some(path) });
+                    return Ok(Statement::Diff {
+                        a,
+                        b,
+                        layer,
+                        relation,
+                        limit,
+                        into_patch: Some(path),
+                    });
                 }
                 _ => break,
             }
         }
 
         self.eat_semicolon();
-        Ok(Statement::Diff { a, b, layer, relation, limit, into_patch: None })
+        Ok(Statement::Diff {
+            a,
+            b,
+            layer,
+            relation,
+            limit,
+            into_patch: None,
+        })
     }
 
     pub(crate) fn parse_use(&mut self) -> Result<Statement, ParseError> {
@@ -188,5 +209,60 @@ impl Parser {
 
         self.eat_semicolon();
         Ok(Statement::Use { target })
+    }
+
+    /// `COMPACT MINOR;`
+    /// `COMPACT MAJOR [FULL] [WITH LAMBDA = <f>];`
+    pub(crate) fn parse_compact(&mut self) -> Result<Statement, ParseError> {
+        self.expect_keyword(Keyword::Compact)?;
+        match self.peek() {
+            crate::lexer::Token::Ident(ref s) if s.eq_ignore_ascii_case("MINOR") => {
+                self.advance();
+                self.eat_semicolon();
+                Ok(Statement::CompactMinor)
+            }
+            crate::lexer::Token::Ident(ref s) if s.eq_ignore_ascii_case("MAJOR") => {
+                self.advance();
+                let full = match self.peek() {
+                    crate::lexer::Token::Keyword(Keyword::All) => {
+                        // COMPACT MAJOR FULL — we reuse ALL since FULL isn't a keyword yet
+                        self.advance();
+                        true
+                    }
+                    crate::lexer::Token::Ident(ref s) if s.eq_ignore_ascii_case("FULL") => {
+                        self.advance();
+                        true
+                    }
+                    _ => false,
+                };
+                let lambda = if self.check_keyword(Keyword::With) {
+                    self.advance();
+                    // WITH LAMBDA = <f> or WITH lambda = <f>
+                    match self.peek() {
+                        crate::lexer::Token::Ident(ref s) if s.eq_ignore_ascii_case("LAMBDA") => {
+                            self.advance();
+                            if !matches!(self.peek(), crate::lexer::Token::Eq) {
+                                return Err(ParseError("expected '=' after LAMBDA".into()));
+                            }
+                            self.advance();
+                            Some(self.expect_f32()?)
+                        }
+                        _ => {
+                            return Err(ParseError(
+                                "expected LAMBDA after WITH in COMPACT MAJOR".into(),
+                            ));
+                        }
+                    }
+                } else {
+                    None
+                };
+                self.eat_semicolon();
+                Ok(Statement::CompactMajor { full, lambda })
+            }
+            _ => Err(ParseError(format!(
+                "expected MINOR or MAJOR after COMPACT, got {:?}",
+                self.peek(),
+            ))),
+        }
     }
 }

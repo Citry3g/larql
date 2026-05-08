@@ -44,8 +44,8 @@ pub enum WalkTier {
     CachedTemplate,
     /// Tier B: dynamic graph walk. Full routing table lookup. 1-5ms.
     DynamicWalk,
-    /// Tier C: hybrid fallback. Fall back to Markov RS / forward pass. ~200ms.
-    HybridFallback,
+    /// Tier C: Markov RS fallback. Full forward pass for free-form generation. ~200ms.
+    MarkovFallback,
 }
 
 impl WalkState {
@@ -82,7 +82,7 @@ impl WalkState {
                     WalkTier::DynamicWalk
                 }
             }
-            WalkMode::Unknown | WalkMode::Conversation => WalkTier::HybridFallback,
+            WalkMode::Unknown | WalkMode::Conversation => WalkTier::MarkovFallback,
             _ => WalkTier::DynamicWalk,
         };
 
@@ -97,9 +97,9 @@ impl WalkState {
     /// Estimated latency for this walk tier in microseconds.
     pub fn estimated_latency_us(&self) -> f64 {
         match self.tier {
-            WalkTier::CachedTemplate => 100.0,    // <0.1ms
-            WalkTier::DynamicWalk => 3_000.0,     // ~3ms
-            WalkTier::HybridFallback => 200_000.0, // ~200ms
+            WalkTier::CachedTemplate => 100.0,     // <0.1ms
+            WalkTier::DynamicWalk => 3_000.0,      // ~3ms
+            WalkTier::MarkovFallback => 200_000.0, // ~200ms
         }
     }
 }
@@ -111,8 +111,11 @@ fn extract_entity(text: &str) -> Option<String> {
     for word in words.iter().rev() {
         let clean = word.trim_matches(|c: char| !c.is_alphanumeric());
         if clean.len() > 1
-            && clean.chars().next().map_or(false, |c| c.is_uppercase())
-            && !["The", "What", "Who", "Where", "How", "Is", "Was", "Tell", "A"].contains(&clean)
+            && clean.chars().next().is_some_and(|c| c.is_uppercase())
+            && ![
+                "The", "What", "Who", "Where", "How", "Is", "Was", "Tell", "A",
+            ]
+            .contains(&clean)
         {
             return Some(clean.to_string());
         }
@@ -144,7 +147,7 @@ mod tests {
     #[test]
     fn test_unknown_falls_back() {
         let state = WalkState::from_tokens(&["tell", "me", "a", "joke"]);
-        assert_eq!(state.tier, WalkTier::HybridFallback);
+        assert_eq!(state.tier, WalkTier::MarkovFallback);
     }
 
     #[test]
@@ -161,7 +164,7 @@ mod tests {
             last_entity: None,
             current_relation: None,
             mode: WalkMode::Conversation,
-            tier: WalkTier::HybridFallback,
+            tier: WalkTier::MarkovFallback,
         };
         assert!(fallback.estimated_latency_us() > 100_000.0);
     }

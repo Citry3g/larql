@@ -8,10 +8,10 @@
 //!   B: dynamic graph walk (1-5ms)
 //!   C: fallback to Markov RS (~200ms)
 
-use larql_inference::model::ModelWeights;
-use larql_inference::forward::embed_tokens_pub;
-use larql_vindex::VectorIndex;
 use crate::graph_walk::walk_state::{WalkState, WalkTier};
+use larql_inference::forward::embed_tokens_pub;
+use larql_inference::model::ModelWeights;
+use larql_vindex::VectorIndex;
 
 /// Result of graph walk prediction.
 pub struct GraphWalkResult {
@@ -86,7 +86,7 @@ pub fn run_graph_walk(
 
             preds
         }
-        WalkTier::HybridFallback => {
+        WalkTier::MarkovFallback => {
             // Fallback: full forward pass via standard predict
             let result = larql_inference::predict(weights, tokenizer, token_ids, top_k);
             result.predictions
@@ -117,7 +117,7 @@ pub fn run_graph_walk_vindex_logits(
     let t0 = std::time::Instant::now();
 
     // Build a WalkLayerGraph: dense attention + walk FFN
-    let walk_ffn = larql_inference::WalkFfn::new(weights, index, 8192);
+    let walk_ffn = larql_inference::WalkFfn::new_unlimited(weights, index);
     let walk_graph = larql_inference::WalkLayerGraph {
         ffn: &walk_ffn,
         backend: None,
@@ -125,7 +125,12 @@ pub fn run_graph_walk_vindex_logits(
 
     // Use the existing predict_with_graph_vindex_logits pipeline
     let result = larql_inference::predict_with_graph_vindex_logits(
-        weights, tokenizer, token_ids, top_k, &walk_graph, index,
+        weights,
+        tokenizer,
+        token_ids,
+        top_k,
+        &walk_graph,
+        index,
     );
 
     let latency_us = t0.elapsed().as_secs_f64() * 1e6;

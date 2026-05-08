@@ -1,19 +1,17 @@
 //! Accuracy suite runner — produces the video frame table.
 //!
-//! Runs all 5 tests across all strategies and outputs:
+//! Runs all tests across all strategies and outputs:
 //! ```text
 //!                     Top-1    KL div    Gen stable    Needle@32K
 //! Standard KV         100%     0.0       baseline      100%
 //! TurboQuant 4-bit    ~99%     ~0.01     ~10 tokens    ~95%
 //! Markov RS           100%     0.0       100%          100%
-//! Hybrid RS+CA        ?        ?         ?             ?
 //! ```
 
-use larql_inference::model::ModelWeights;
-use larql_inference::forward::{predict, logits_to_predictions_pub, PredictResult};
-use larql_inference::ffn::WeightFfn;
-use crate::accuracy;
 use super::prompts::TestPrompt;
+use crate::accuracy;
+use larql_inference::forward::predict;
+use larql_inference::model::ModelWeights;
 
 /// Per-strategy accuracy scores across all tests.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -55,7 +53,8 @@ pub fn test_paris(
     backend: &dyn larql_compute::ComputeBackend,
 ) -> Vec<(String, bool)> {
     let bench = crate::real_model::RealModelBenchmark::new(weights, tokenizer, index, backend);
-    let results = crate::real_model::runner::run_all_strategies(&bench, "The capital of France is", 5, 512);
+    let results =
+        crate::real_model::runner::run_all_strategies(&bench, "The capital of France is", 5, 512);
 
     results
         .iter()
@@ -81,19 +80,14 @@ pub fn test_top1_match_rate(
     let mut results = Vec::new();
 
     for prompt in prompts {
-        let strat_results = crate::real_model::runner::run_all_strategies(
-            &bench, prompt.text, 5, 512,
-        );
+        let strat_results =
+            crate::real_model::runner::run_all_strategies(&bench, prompt.text, 5, 512);
 
         let baseline_top1 = strat_results[0].top1_token.clone();
         let mut strategy_results = Vec::new();
 
         for r in &strat_results {
-            strategy_results.push((
-                r.strategy.clone(),
-                r.top1_token.clone(),
-                r.top1_match,
-            ));
+            strategy_results.push((r.strategy.clone(), r.top1_token.clone(), r.top1_match));
         }
 
         results.push(PromptResult {
@@ -200,9 +194,17 @@ pub fn compute_strategy_accuracy(prompt_results: &[PromptResult]) -> Vec<Strateg
                 top1_match_rate: matches as f64 / total as f64,
                 top1_matches: matches,
                 top1_total: total,
-                mean_kl_divergence: if name.contains("Markov") { 0.0 } else { f64::NAN },
+                mean_kl_divergence: if name.contains("Markov") {
+                    0.0
+                } else {
+                    f64::NAN
+                },
                 gen_first_diverge: None,
-                gen_token_match_rate: if name.contains("Markov") || name.contains("Standard") { 1.0 } else { 0.0 },
+                gen_token_match_rate: if name.contains("Markov") || name.contains("Standard") {
+                    1.0
+                } else {
+                    0.0
+                },
                 needle_pass_rate: 0.0,
                 needle_passes: 0,
                 needle_total: 0,
